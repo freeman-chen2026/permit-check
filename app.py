@@ -4,8 +4,8 @@
 - 飞行员名单内置
 - 航班信息文本框粘贴
 - 内置机型对照表
-- 标红时保留原字体
-- 支持内机 / 外机不同批复格式
+- 标红时只改颜色，绝不动文本
+- 内机/外机分别处理
 """
 
 import io
@@ -118,15 +118,12 @@ st.set_page_config(page_title="国内批复核对工具", page_icon="✈️", la
 # 工具
 # =========================================================
 def parse_date_token(token):
-    """支持 01OCT2026 和 01OCT26 两种年份"""
+    """支持 01OCT2026 和 01OCT26"""
     token = token.strip().upper()
     day = int(token[:2])
     mon = MONTHS[token[2:5]]
     year_str = token[5:]
-    if len(year_str) == 2:
-        year = 2000 + int(year_str)
-    else:
-        year = int(year_str)
+    year = 2000 + int(year_str) if len(year_str) == 2 else int(year_str)
     return datetime.date(year, mon, day)
 
 
@@ -217,14 +214,14 @@ def crew_all_chinese(crew_codes, pilots):
 
 
 # =========================================================
-# 解析批复（支持内机 / 外机两种格式）
+# 解析批复
 # =========================================================
 APPROVAL_RE = re.compile(
     r"^(?P<reg>[A-Z0-9\-]+)\s+"
-    r"(?P<second>[A-Z0-9]+)\s+"          # B 注册是机型；外机是航班号
+    r"(?P<second>[A-Z0-9]+)\s+"
     r"(?P<dep>[A-Z]{4})(?P<dep_time>\d{4})\s+"
     r"(?P<arr_time>\d{4})(?P<arr>[A-Z]{4})\s+"
-    r"ON\s+(?P<date>\d{2}[A-Z]{3}\d{2,4})\s+"   # 支持 2 位 / 4 位年份
+    r"ON\s+(?P<date>\d{2}[A-Z]{3}\d{2,4})\s+"
     r"(?P<rest>.+)$",
     re.IGNORECASE,
 )
@@ -297,7 +294,7 @@ def iter_doc_paragraphs(doc):
 
 
 # =========================================================
-# 读取 Excel
+# Excel
 # =========================================================
 def load_excel_rows_from_bytes(data: bytes):
     wb = load_workbook(io.BytesIO(data), data_only=True)
@@ -324,7 +321,7 @@ def load_excel_rows_from_bytes(data: bytes):
 
 
 # =========================================================
-# 解析文本航班信息
+# 文本航班信息
 # =========================================================
 FLIGHT_HEADER_RE = re.compile(
     r"^([A-Z0-9]+)\s+(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})(?:\s*\+1)?$"
@@ -407,7 +404,7 @@ def find_text_match(approval, text_flights, city_to_icao):
 
 
 # =========================================================
-# docx 标红（保留原字体）
+# docx 标红（只改颜色，绝不动文本）
 # =========================================================
 W_R = qn('w:r')
 W_RPR = qn('w:rPr')
@@ -416,6 +413,7 @@ W_T = qn('w:t')
 
 
 def _set_run_red(run_element):
+    """给 run 的 rPr 增加红色，保留其他属性"""
     rPr = run_element.find(W_RPR)
     if rPr is None:
         rPr = run_element.makeelement(W_RPR, {})
@@ -426,9 +424,31 @@ def _set_run_red(run_element):
     rPr.append(color)
 
 
+def _make_run_like(src_run_elem, text, red):
+    """复制 src_run_elem 的 XML（含字体），只把文本换成 text；red=True 时加红色"""
+    new_r = copy.deepcopy(src_run_elem)
+    # 删除所有 w:t，保留其它子节点（如 w:rPr）
+    for t in new_r.findall(W_T):
+        new_r.remove(t)
+    t = new_r.makeelement(W_T, {})
+    t.text = text
+    t.set(qn('xml:space'), 'preserve')
+    new_r.append(t)
+    if red:
+        _set_run_red(new_r)
+    return new_r
+
+
 def set_paragraph_runs(paragraph, text, red_parts):
+    """
+    仅对需要标红的部分修改颜色：
+    - 不含红色的 run 原封不动
+    - 整个 run 都是红色的，直接给该 run 加红
+    - 部分红色的 run，才拆分；拆出的片段复制原 run 格式
+    """
     if not red_parts:
         return
+
     runs = list(paragraph.runs)
     if not runs:
         return
@@ -436,15 +456,15 @@ def set_paragraph_runs(paragraph, text, red_parts):
     full_text = "".join(r.text for r in runs)
     if not full_text:
         return
-    text = full_text
 
+    # 计算段落内红色字符区间
     ranges = []
     for part in red_parts:
         if not part:
             continue
         start = 0
         while True:
-            idx = text.find(part, start)
+            idx = full_text.find(part, start)
             if idx == -1:
                 break
             ranges.append((idx, idx + len(part)))
@@ -461,41 +481,56 @@ def set_paragraph_runs(paragraph, text, red_parts):
         else:
             merged.append((a, b))
 
-    def is_red(idx):
+    def is_red(pos):
         for a, b in merged:
-            if a <= idx < b:
+            if a <= pos < b:
                 return True
         return False
 
-    char_run = []
-    for r in runs:
-        char_run.extend([r] * len(r.text))
+    pos = 0
+    for run in runs:
+        r_text = run.text
+        if not r_text:
+            continue
 
-    segments = []
-    i = 0
-    while i < len(text):
-        red_now = is_red(i)
-        j = i + 1
-        while j < len(text) and is_red(j) == red_now:
-            j += 1
-        segments.append((text[i:j], red_now, char_run[i]))
-        i = j
+        r_start = pos
+        r_len = len(r_text)
 
-    p_elem = paragraph._element
-    for r_elem in p_elem.findall(W_R):
-        p_elem.remove(r_elem)
+        # 该 run 的红色状态
+        red_flags = [is_red(r_start + i) for i in range(r_len)]
+        if not any(red_flags):
+            pos += r_len
+            continue
 
-    for seg_text, red, src_run in segments:
-        new_r = copy.deepcopy(src_run._element)
-        for t in new_r.findall(W_T):
-            new_r.remove(t)
-        t_elem = new_r.makeelement(W_T, {})
-        t_elem.text = seg_text
-        t_elem.set(qn('xml:space'), 'preserve')
-        new_r.append(t_elem)
-        if red:
-            _set_run_red(new_r)
-        p_elem.append(new_r)
+        if all(red_flags):
+            # 整个 run 标红，直接改颜色，不动文本结构
+            _set_run_red(run._element)
+            pos += r_len
+            continue
+
+        # 部分红色：拆分这个 run
+        run_elem = run._element
+        parent = run_elem.getparent()
+        idx_in_parent = list(parent).index(run_elem)
+
+        # 切成片段
+        pieces = []
+        i = 0
+        while i < r_len:
+            red_now = red_flags[i]
+            j = i + 1
+            while j < r_len and red_flags[j] == red_now:
+                j += 1
+            pieces.append((r_text[i:j], red_now))
+            i = j
+
+        # 移除原 run，按顺序插入新片段
+        parent.remove(run_elem)
+        for k, (seg, red) in enumerate(pieces):
+            new_r = _make_run_like(run_elem, seg, red)
+            parent.insert(idx_in_parent + k, new_r)
+
+        pos += r_len
 
 
 # =========================================================
@@ -545,7 +580,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                 diffs.append(f"机型：批复 {approval['type']} vs 对照表 {expected_type}")
                 red_parts.append(approval["type"])
 
-        # ---- Excel ----
+        # ---- Excel 比对（内机、外机都做） ----
         if excel_row:
             if approval["dep"] != excel_row["dep"]:
                 diffs.append(f"起飞机场：批复 {approval['dep']} vs 计划 {excel_row['dep']}")
@@ -604,7 +639,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
             "飞机号": approval["reg"],
             "航班号": approval["flight_no"] if not approval["is_domestic"] else "",
             "机型": approval["type"] if approval["is_domestic"]
-                    else AIRCRAFT_TYPE_MAP.get(approval["reg"], ""),
+                    else "",
             "内/外机": "内机" if approval["is_domestic"] else "外机",
             "批复起飞(北京时)": approval_dep_time,
             "批复落地(北京时)": approval_arr_time,
@@ -646,12 +681,12 @@ with st.sidebar:
     st.markdown(
         "**说明**\n"
         "- 飞行员名单已内置，无需上传\n"
-        "- 机型对照表已内置\n"
+        "- 机型对照表已内置，只对 B 注册核对\n"
         "- **内机**：`注册号 机型 起飞机场+时间 到达时间+到达机场 ON 日期 U/H|N/M`\n"
         "- **外机**：`注册号 航班号 起飞机场+时间 到达时间+到达机场 ON 日期 U/H|N/M`\n"
-        "- B 注册号批复时间按北京时间；其他按世界时 UTC +8\n"
-        "- `U/H` → 载客，`N/M` → 调机\n"
-        "- 外机不核对机组中国籍"
+        "- 外机不核对机型、不核对中国籍机组\n"
+        "- B 注册批复时间按北京时间；其他按世界时 UTC +8\n"
+        "- `U/H` → 载客，`N/M` → 调机"
     )
 
 text_input = st.text_area(
