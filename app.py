@@ -12,9 +12,9 @@
 - 用途三方交叉校验：批复 vs Excel vs 文本 F
 - 落地时间 30 分钟容差（仅当起飞时间一致时）
 - 起降机场组合在 Excel 中找不到 -> 待取消
-- Excel 有计划但批复没有且含 Z 机场 -> 待申请（按日期插入）
+- Excel 有计划但批复没有且含 Z 机场 -> 待申请（按日期插入，同航段不同日期视为不同航段）
 - 国籍写错 → 直接标红错误标签
-- 批复之间不再插入空行
+- 批复之间不插入空行
 - 下载文件保持原文件名
 """
 
@@ -637,7 +637,6 @@ def _make_red_paragraph_element(text, template_p):
 
 
 def _reorder_cell_with_pending(cell, pending_items, global_template_p):
-    """按日期重排批复；不留空行"""
     existing_items = []
     template_p = None
     for p in cell.paragraphs:
@@ -668,7 +667,6 @@ def _reorder_cell_with_pending(cell, pending_items, global_template_p):
     for p_elem in list(tc.findall(qn('w:p'))):
         tc.remove(p_elem)
 
-    # 批复之间不再插入空段落
     for item in existing_items:
         if item["type"] == "existing":
             tc.append(item["element"])
@@ -733,7 +731,8 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
     result_rows = []
     approval_red_map = {}
     cancel_paragraphs = []
-    approved_combos = set()
+    # (reg, dep, arr) -> set(日期)
+    approved_index = {}
 
     # ===== 第一遍：核对 docx 已有批复 =====
     for p in iter_doc_paragraphs(doc):
@@ -745,7 +744,9 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         if not approval:
             continue
 
-        approved_combos.add((approval["reg"], approval["dep"], approval["arr"]))
+        approved_index.setdefault(
+            (approval["reg"], approval["dep"], approval["arr"]), set()
+        ).add(approval["dep_dt_bj"].date())
 
         red_parts = []
         diffs = []
@@ -792,7 +793,6 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         approval_dep_time = approval["dep_dt_bj"].strftime("%H:%M")
         approval_arr_time = approval["arr_dt_bj"].strftime("%H:%M")
 
-        # 机型（内机）
         if approval["is_domestic"]:
             expected_type = AIRCRAFT_TYPE_MAP.get(approval["reg"])
             if expected_type is None:
@@ -845,7 +845,6 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                     if approval["service"] not in red_parts:
                         red_parts.append(approval["service"])
 
-        # 国籍（内机）
         if approval["is_domestic"]:
             if text_flight:
                 all_cn = crew_all_chinese(text_flight["crew"], pilots)
@@ -896,27 +895,32 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         if diffs:
             approval_red_map[raw_text] = red_parts
 
-    # ---- 标红 ----
+    # 标红
     for p in iter_doc_paragraphs(doc):
         raw_text = p.text.strip()
         if raw_text in approval_red_map:
             set_paragraph_runs(p, raw_text, approval_red_map[raw_text])
 
-    # ---- 追加"待取消" ----
+    # 追加"待取消"
     for p in iter_doc_paragraphs(doc):
         raw_text = p.text.strip()
         if raw_text in cancel_paragraphs:
             append_red_text(p, "  待取消")
 
     # ===== 第二遍：待申请 =====
+    # 判断标准：Excel 有、批复无该航段日期（即使同航段其他日期已有批复）
     pending_by_reg = {}
     for row in excel_rows:
         if not row["reg"]:
             continue
         if not (row["dep"].startswith("Z") or row["arr"].startswith("Z")):
             continue
-        if (row["reg"], row["dep"], row["arr"]) not in approved_combos:
-            pending_by_reg.setdefault(row["reg"], []).append(row)
+        if row["dep_date"] is None:
+            continue
+        key = (row["reg"], row["dep"], row["arr"])
+        if row["dep_date"] in approved_index.get(key, set()):
+            continue
+        pending_by_reg.setdefault(row["reg"], []).append(row)
 
     pending_rows = []
     global_template_p = find_global_template_paragraph(doc)
@@ -1053,7 +1057,8 @@ with st.sidebar:
         "- **用途三方交叉校验**：批复 vs Excel vs 文本 F\n"
         "- **落地时间容差**：起飞时间一致时，落地时间差 ≤ 30 分钟视为一致\n"
         "- **待取消**：批复的起降机场组合在 Excel 找不到 → 段落末尾追加红色“待取消”\n"
-        "- **待申请**：Excel 有、批复无，且起降机场至少一个 Z 开头 → 按日期插入到该飞机批复中\n"
+        "- **待申请**：Excel 有、批复无该航段日期（含 Z 机场）→ 按日期插入到该飞机批复中\n"
+        "  - 同航段组合、不同日期视为不同航段，分别对待\n"
         "- **国籍核对**：批复与文本机组国籍不符 → 标红批复里的标签\n"
         "- B 注册批复时间按北京时间；其他按世界时 UTC +8\n"
         "- 文本里单独的 `F` 属于**下一段**航班"
