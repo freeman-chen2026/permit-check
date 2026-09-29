@@ -9,10 +9,10 @@
   · 例外 2：待申请 → 按日期插入到该飞机批复队列中，+ 红色"待申请"
 - 内机/外机分别处理
 - 用途：调机/维修 -> N/M，其余 -> U/H
-- 用途三方交叉校验：批复 vs Excel vs 文本 F
+- 用途三方交叉校验：批复 vs Excel vs 文本 F（漏 F / 多 F 均提示）
 - 落地时间 30 分钟容差（仅当起飞时间一致时）
 - 起降机场组合在 Excel 中找不到 -> 待取消
-- Excel 有计划但批复没有且含 Z 机场 -> 待申请（按日期插入，同航段不同日期视为不同航段）
+- Excel 有计划但批复没有（按日期判重）-> 待申请
 - 国籍写错 → 直接标红错误标签
 - 批复之间不插入空行
 - 下载文件保持原文件名
@@ -731,7 +731,6 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
     result_rows = []
     approval_red_map = {}
     cancel_paragraphs = []
-    # (reg, dep, arr) -> set(日期)
     approved_index = {}
 
     # ===== 第一遍：核对 docx 已有批复 =====
@@ -835,12 +834,18 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                 )
                 red_parts.append(approval["service"])
 
+            # ---- 文本 F 标记核对（漏 F / 多 F）----
             if text_flight is not None:
                 text_ferry = text_flight.get("is_ferry", False)
-                if text_ferry != excel_ferry:
-                    text_label = "调机(F)" if text_ferry else "载客(无F)"
+                if excel_ferry and not text_ferry:
                     diffs.append(
-                        f"调机标记：文本 {text_label} vs Excel {excel_row['use']}"
+                        f"⚠ 文本漏 F 标记（Excel 为调机：{excel_row['use']}）"
+                    )
+                    if approval["service"] not in red_parts:
+                        red_parts.append(approval["service"])
+                elif not excel_ferry and text_ferry:
+                    diffs.append(
+                        f"⚠ 文本多标 F 标记（Excel 为 {excel_row['use']}，非调机）"
                     )
                     if approval["service"] not in red_parts:
                         red_parts.append(approval["service"])
@@ -908,7 +913,6 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
             append_red_text(p, "  待取消")
 
     # ===== 第二遍：待申请 =====
-    # 判断标准：Excel 有、批复无该航段日期（即使同航段其他日期已有批复）
     pending_by_reg = {}
     for row in excel_rows:
         if not row["reg"]:
@@ -1054,11 +1058,10 @@ with st.sidebar:
         "**说明**\n"
         "- 飞行员名单、机型对照表已内置\n"
         "- **用途规则**：Excel 为 `调机` / `维修` → `N/M`；其余 → `U/H`\n"
-        "- **用途三方交叉校验**：批复 vs Excel vs 文本 F\n"
+        "- **用途三方交叉校验**：批复 vs Excel vs 文本 F，漏 F / 多 F 均提示\n"
         "- **落地时间容差**：起飞时间一致时，落地时间差 ≤ 30 分钟视为一致\n"
         "- **待取消**：批复的起降机场组合在 Excel 找不到 → 段落末尾追加红色“待取消”\n"
         "- **待申请**：Excel 有、批复无该航段日期（含 Z 机场）→ 按日期插入到该飞机批复中\n"
-        "  - 同航段组合、不同日期视为不同航段，分别对待\n"
         "- **国籍核对**：批复与文本机组国籍不符 → 标红批复里的标签\n"
         "- B 注册批复时间按北京时间；其他按世界时 UTC +8\n"
         "- 文本里单独的 `F` 属于**下一段**航班"
