@@ -7,16 +7,14 @@
 - 标红时只改颜色，绝不动文本
   · 例外 1：待取消 → 段落末尾追加红色"待取消"
   · 例外 2：待申请 → 按日期插入到该飞机批复队列中，+ 红色"待申请"
-             · 文本机组全中国籍 → 加" 中国籍"
-             · 文本含外籍机组 → 加" 外籍"
-             · 文本无机组/无法判断 → 加"（机组未定，需确认）"特别提醒
 - 内机/外机分别处理
 - 用途：调机/维修 -> N/M，其余 -> U/H
 - 用途三方交叉校验：批复 vs Excel vs 文本 F
 - 落地时间 30 分钟容差（仅当起飞时间一致时）
 - 起降机场组合在 Excel 中找不到 -> 待取消
 - Excel 有计划但批复没有且含 Z 机场 -> 待申请（按日期插入）
-- 国籍写错 → 直接标红错误标签，差异描述简洁
+- 国籍写错 → 直接标红错误标签
+- 批复之间不再插入空行
 - 下载文件保持原文件名
 """
 
@@ -226,12 +224,6 @@ def load_pilots():
 
 
 def crew_all_chinese(crew_codes, pilots):
-    """
-    返回：
-      True  -> 全中国籍
-      False -> 含外籍
-      None  -> 名单不全或无法判断
-    """
     pilot_codes = [c.strip() for c in crew_codes if c.strip().startswith(("P", "W"))]
     if not pilot_codes:
         return None
@@ -645,6 +637,7 @@ def _make_red_paragraph_element(text, template_p):
 
 
 def _reorder_cell_with_pending(cell, pending_items, global_template_p):
+    """按日期重排批复；不留空行"""
     existing_items = []
     template_p = None
     for p in cell.paragraphs:
@@ -675,15 +668,13 @@ def _reorder_cell_with_pending(cell, pending_items, global_template_p):
     for p_elem in list(tc.findall(qn('w:p'))):
         tc.remove(p_elem)
 
-    for i, item in enumerate(existing_items):
+    # 批复之间不再插入空段落
+    for item in existing_items:
         if item["type"] == "existing":
             tc.append(item["element"])
         else:
             new_p = _make_red_paragraph_element(item["text"], template_p)
             tc.append(new_p)
-
-        if i < len(existing_items) - 1:
-            tc.append(OxmlElement('w:p'))
 
 
 # =========================================================
@@ -854,7 +845,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                     if approval["service"] not in red_parts:
                         red_parts.append(approval["service"])
 
-        # 国籍（内机）：写错直接标红错误标签
+        # 国籍（内机）
         if approval["is_domestic"]:
             if text_flight:
                 all_cn = crew_all_chinese(text_flight["crew"], pilots)
@@ -864,14 +855,12 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                     has_cn = "中国籍" in approval["remark"]
                     has_foreign = "外籍" in approval["remark"]
                     if all_cn:
-                        # 期望：中国籍
                         if has_foreign:
                             diffs.append("国籍标注错误（应为中国籍）")
                             red_parts.append("外籍")
                         elif not has_cn:
                             diffs.append("国籍未标注（应为中国籍）")
                     else:
-                        # 期望：外籍
                         if has_cn:
                             diffs.append("国籍标注错误（应为外籍）")
                             red_parts.append("中国籍")
@@ -1065,10 +1054,7 @@ with st.sidebar:
         "- **落地时间容差**：起飞时间一致时，落地时间差 ≤ 30 分钟视为一致\n"
         "- **待取消**：批复的起降机场组合在 Excel 找不到 → 段落末尾追加红色“待取消”\n"
         "- **待申请**：Excel 有、批复无，且起降机场至少一个 Z 开头 → 按日期插入到该飞机批复中\n"
-        "  - 文本机组全中国籍 → 加 `中国籍`\n"
-        "  - 文本含外籍机组 → 加 `外籍`\n"
-        "  - **文本无机组/查不到** → 加 `（机组未定，需确认）`，需特别留意\n"
-        "- **国籍核对**：批复与文本机组国籍不符 → 直接标红批复里的 `中国籍`/`外籍` 标签\n"
+        "- **国籍核对**：批复与文本机组国籍不符 → 标红批复里的标签\n"
         "- B 注册批复时间按北京时间；其他按世界时 UTC +8\n"
         "- 文本里单独的 `F` 属于**下一段**航班"
     )
