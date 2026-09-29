@@ -7,6 +7,10 @@
 - 标红时只改颜色，绝不动文本
 - 内机/外机分别处理
 - 用途：调机/维修 -> N/M，其余 -> U/H
+- 用途三方交叉校验：批复 vs Excel vs 文本 F
+- 落地时间 30 分钟容差（仅当起飞时间一致时）
+- 起降机场组合在 Excel 中找不到 -> 待取消
+- 下载文件保持原文件名
 """
 
 import io
@@ -112,7 +116,6 @@ AIRCRAFT_TYPE_MAP = {
     "B65AP": "GLF4",
 }
 
-# 视为调机的用途关键词（其余一律视为载客）
 FERRY_KEYWORDS = ("调机", "维修")
 
 st.set_page_config(page_title="国内批复核对工具", page_icon="✈️", layout="wide")
@@ -122,7 +125,6 @@ st.set_page_config(page_title="国内批复核对工具", page_icon="✈️", la
 # 工具
 # =========================================================
 def parse_date_token(token):
-    """支持 01OCT2026 和 01OCT26"""
     token = token.strip().upper()
     day = int(token[:2])
     mon = MONTHS[token[2:5]]
@@ -218,7 +220,6 @@ def crew_all_chinese(crew_codes, pilots):
 
 
 def is_ferry_use(use_text):
-    """调机/维修 -> True；其余（载客、共享租赁、展示飞行、包机、小时卡…）-> False"""
     return any(k in use_text for k in FERRY_KEYWORDS)
 
 
@@ -329,7 +330,7 @@ def load_excel_rows_from_bytes(data: bytes):
 
 
 # =========================================================
-# 文本航班信息（支持 F 标记）
+# 文本航班信息（F 归属下一段）
 # =========================================================
 FLIGHT_HEADER_RE = re.compile(
     r"^([A-Z0-9]+)\s+(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})(?:\s*\+1)?$"
@@ -340,18 +341,16 @@ def load_text_flights(text: str):
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     flights = []
     i = 0
-    pending_f = False  # 上一行是单独的 F 标记
+    pending_f = False
 
     while i < len(lines):
         line = lines[i]
 
-        # 单独的 F 行 -> 下一段是调机
         if line.upper() == "F":
             pending_f = True
             i += 1
             continue
 
-        # TBA / 其他标记行：跳过（不影响解析）
         if line.upper() in ("TBA",):
             i += 1
             continue
@@ -368,6 +367,7 @@ def load_text_flights(text: str):
                         cl = lines[i + 2].replace(" ", "")
                         if re.match(r"^[A-Z0-9,]+$", cl):
                             crew = [x for x in cl.split(",") if x]
+
                     flights.append({
                         "reg": reg,
                         "dep_time": dep_time,
@@ -388,27 +388,23 @@ def load_text_flights(text: str):
 # 匹配
 # =========================================================
 def find_excel_match(approval, excel_rows):
+    """找该注册号 + 起降机场组合的 Excel 行；找不到返回 None"""
     candidates = [
         r for r in excel_rows
         if r["reg"] == approval["reg"]
         and r["dep"] == approval["dep"]
         and r["arr"] == approval["arr"]
-        and r["dep_date"] == approval["dep_dt_bj"].date()
     ]
     if not candidates:
-        candidates = [
-            r for r in excel_rows
-            if r["reg"] == approval["reg"]
-            and r["dep"] == approval["dep"]
-            and r["arr"] == approval["arr"]
-        ]
-    if not candidates:
-        candidates = [r for r in excel_rows if r["reg"] == approval["reg"]]
-    if not candidates:
         return None
+
+    # 优先日期一致的
+    same_date = [r for r in candidates if r["dep_date"] == approval["dep_dt_bj"].date()]
+    pool = same_date if same_date else candidates
+
     target = approval["dep_dt_bj"].strftime("%H:%M")
-    candidates.sort(key=lambda r: time_diff_minutes(r["dep_time"], target))
-    return candidates[0]
+    pool.sort(key=lambda r: time_diff_minutes(r["dep_time"], target))
+    return pool[0]
 
 
 def find_text_match(approval, text_flights, city_to_icao):
@@ -571,14 +567,52 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
 
         red_parts = []
         diffs = []
+        cancel_note = ""
 
+        # ---- 先检查起降机场组合在 Excel 中是否存在 ----
+        airport_exists = any(
+            r["reg"] == approval["reg"]
+            and r["dep"] == approval["dep"]
+            and r["arr"] == approval["arr"]
+            for r in excel_rows
+        )
+
+        if not airport_exists:
+            # 起降机场组合在 Excel 里完全找不到 -> 待取消
+            cancel_note = "待取消"
+            red_parts.append(approval["dep"])
+            red_parts.append(approval["arr"])
+
+            result_rows.append({
+                "批复": raw_text,
+                "飞机号": approval["reg"],
+                "航班号": approval["flight_no"] if not approval["is_domestic"] else "",
+                "机型": approval["type"] if approval["is_domestic"] else "",
+                "内/外机": "内机" if approval["is_domestic"] else "外机",
+                "批复起飞(北京时)": approval["dep_dt_bj"].strftime("%H:%M"),
+                "批复落地(北京时)": approval["arr_dt_bj"].strftime("%H:%M"),
+                "批复日期": approval["dep_dt_bj"].date().isoformat(),
+                "Excel 用途": "",
+                "文本标记": "",
+                "Excel 计划起飞": "",
+                "Excel 计划落地": "",
+                "Excel 出发地": "",
+                "Excel 到达地": "",
+                "差异": "起降机场组合在 Excel 中不存在",
+                "是否一致": "否",
+                "备注": cancel_note,
+            })
+            approval_red_map[raw_text] = red_parts
+            continue
+
+        # ---- 正常比对 ----
         excel_row = find_excel_match(approval, excel_rows)
         text_flight = find_text_match(approval, text_flights, city_to_icao)
 
         approval_dep_time = approval["dep_dt_bj"].strftime("%H:%M")
         approval_arr_time = approval["arr_dt_bj"].strftime("%H:%M")
 
-        # ---- 机型：仅对 B 注册核对 ----
+        # 机型：仅对 B 注册核对
         if approval["is_domestic"]:
             expected_type = AIRCRAFT_TYPE_MAP.get(approval["reg"])
             if expected_type is None:
@@ -588,42 +622,53 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                 diffs.append(f"机型：批复 {approval['type']} vs 对照表 {expected_type}")
                 red_parts.append(approval["type"])
 
-        # ---- Excel 比对 ----
         if excel_row:
-            if approval["dep"] != excel_row["dep"]:
-                diffs.append(f"起飞机场：批复 {approval['dep']} vs 计划 {excel_row['dep']}")
-                red_parts.append(approval["dep"])
-            if approval["arr"] != excel_row["arr"]:
-                diffs.append(f"到达机场：批复 {approval['arr']} vs 计划 {excel_row['arr']}")
-                red_parts.append(approval["arr"])
-            if approval_dep_time != excel_row["dep_time"]:
+            # 时间：起飞一致 & 落地差 <= 30 分钟 -> 不算差异
+            dep_same = (approval_dep_time == excel_row["dep_time"])
+            if not dep_same:
                 diffs.append(
                     f"起飞时间：批复 {approval_dep_time} vs 计划 {excel_row['dep_time']}"
                 )
                 red_parts.append(approval["dep_time_raw"])
-            if approval_arr_time != excel_row["arr_time"]:
-                diffs.append(
-                    f"落地时间：批复 {approval_arr_time} vs 计划 {excel_row['arr_time']}"
-                )
-                red_parts.append(approval["arr_time_raw"])
+
+            arr_same = (approval_arr_time == excel_row["arr_time"])
+            if not arr_same:
+                arr_gap = time_diff_minutes(approval_arr_time, excel_row["arr_time"])
+                if not (dep_same and arr_gap <= 30):
+                    diffs.append(
+                        f"落地时间：批复 {approval_arr_time} vs 计划 {excel_row['arr_time']}"
+                    )
+                    red_parts.append(approval["arr_time_raw"])
+
+            # 日期
             if excel_row["dep_date"] and approval["dep_dt_bj"].date() != excel_row["dep_date"]:
                 diffs.append(
                     f"起飞日期：批复 {approval['dep_dt_bj'].date()} vs 计划 {excel_row['dep_date']}"
                 )
                 red_parts.append(approval["date_raw"])
 
-            # ---- 用途：Excel 是调机/维修 -> N/M，其余 -> U/H ----
-            expected_service = "N/M" if is_ferry_use(excel_row["use"]) else "U/H"
+            # 用途三方交叉校验
+            excel_ferry = is_ferry_use(excel_row["use"])
+            expected_service = "N/M" if excel_ferry else "U/H"
+
             if approval["service"] != expected_service:
                 diffs.append(
                     f"用途：批复 {approval['service']} vs 计划 {excel_row['use']}"
                     f"（应为 {expected_service}）"
                 )
                 red_parts.append(approval["service"])
-        else:
-            diffs.append("未在 Excel 中找到匹配航段")
 
-        # ---- 中国籍：仅对 B 注册核对 ----
+            if text_flight is not None:
+                text_ferry = text_flight.get("is_ferry", False)
+                if text_ferry != excel_ferry:
+                    text_label = "调机(F)" if text_ferry else "载客(无F)"
+                    diffs.append(
+                        f"调机标记：文本 {text_label} vs Excel {excel_row['use']}"
+                    )
+                    if approval["service"] not in red_parts:
+                        red_parts.append(approval["service"])
+
+        # 中国籍：仅对 B 注册核对
         if approval["is_domestic"]:
             if text_flight:
                 all_cn = crew_all_chinese(text_flight["crew"], pilots)
@@ -640,6 +685,10 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
             else:
                 diffs.append("未找到对应文本版航班信息，无法核验机组")
 
+        text_ferry_label = ""
+        if text_flight is not None:
+            text_ferry_label = "调机(F)" if text_flight.get("is_ferry", False) else "载客(无F)"
+
         result_rows.append({
             "批复": raw_text,
             "飞机号": approval["reg"],
@@ -650,12 +699,14 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
             "批复落地(北京时)": approval_arr_time,
             "批复日期": approval["dep_dt_bj"].date().isoformat(),
             "Excel 用途": excel_row["use"] if excel_row else "",
+            "文本标记": text_ferry_label,
             "Excel 计划起飞": excel_row["dep_time"] if excel_row else "",
             "Excel 计划落地": excel_row["arr_time"] if excel_row else "",
             "Excel 出发地": excel_row["dep"] if excel_row else "",
             "Excel 到达地": excel_row["arr"] if excel_row else "",
             "差异": "；".join(diffs) if diffs else "无",
             "是否一致": "否" if diffs else "是",
+            "备注": cancel_note,
         })
 
         if diffs:
@@ -687,12 +738,15 @@ with st.sidebar:
     st.markdown(
         "**说明**\n"
         "- 飞行员名单、机型对照表已内置\n"
-        "- **用途规则**：Excel 为 `调机` / `维修` → 批复应为 `N/M`；"
-        "其余（载客、共享租赁、展示飞行、包机、小时卡、悦享家、置换…）→ 批复应为 `U/H`\n"
+        "- **用途规则**：Excel 为 `调机` / `维修` → 应为 `N/M`；其余 → 应为 `U/H`\n"
+        "- **用途三方交叉校验**：批复 vs Excel vs 文本 F\n"
+        "- **落地时间容差**：起飞时间一致时，落地时间差 ≤ 30 分钟视为一致\n"
+        "- **待取消**：批复的起降机场组合在 Excel 中完全找不到\n"
         "- **内机**：`注册号 机型 起飞机场+时间 到达时间+到达机场 ON 日期 U/H|N/M`\n"
         "- **外机**：`注册号 航班号 起飞机场+时间 到达时间+到达机场 ON 日期 U/H|N/M`\n"
         "- 外机不核对机型、不核对中国籍机组\n"
-        "- B 注册批复时间按北京时间；其他按世界时 UTC +8"
+        "- B 注册批复时间按北京时间；其他按世界时 UTC +8\n"
+        "- 文本里单独的 `F` 属于**下一段**航班"
     )
 
 text_input = st.text_area(
@@ -700,10 +754,14 @@ text_input = st.text_area(
     height=320,
     placeholder=(
         "例如：\n"
+        "B65AP 16:30 - 17:45\n"
+        "香港 - 泉州晋江\n"
+        "P057,P039,C046,M035\n"
+        "\n"
         "F\n"
-        "B652Q 13:45 - 16:30\n"
-        "上海虹桥 - 成都双流\n"
-        "P072,P071,C050,M021"
+        "B652Q 19:15 - 21:30\n"
+        "北京大兴 - 宁波栎社\n"
+        "M021"
     ),
 )
 
@@ -751,19 +809,23 @@ if st.button("🚀 开始核对", type="primary"):
         )
 
         st.subheader("🚨 差异明细")
-        diffs_df = df[df["是否一致"] == "否"][["批复", "差异"]]
+        diffs_df = df[df["是否一致"] == "否"][["批复", "差异", "备注"]]
         if diffs_df.empty:
             st.success("✅ 所有批复与计划一致，未发现差异。")
         else:
             for _, r in diffs_df.iterrows():
-                st.markdown(f"**`{r['批复']}`**")
+                note_html = (
+                    f" <span style='color:red;font-weight:bold'>【{r['备注']}】</span>"
+                    if r["备注"] else ""
+                )
+                st.markdown(f"**`{r['批复']}`**{note_html}", unsafe_allow_html=True)
                 for line in r["差异"].split("；"):
                     st.markdown(f"- {line}")
 
     st.subheader("📥 下载标红后的批复汇总表")
     st.download_button(
-        label="下载 _已核对标红.docx",
+        label=f"下载 {docx_file.name}",
         data=out_buf.getvalue(),
-        file_name=docx_file.name.replace(".docx", "_已核对标红.docx"),
+        file_name=docx_file.name,
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
