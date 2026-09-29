@@ -2,18 +2,21 @@
 """
 国内批复核对工具 - Streamlit 版本
 - 飞行员名单内置
-- 航班信息支持文本框粘贴
+- 航班信息文本框粘贴
 - 内置机型对照表
+- 标红时保留原字体
 """
 
 import io
 import re
 import csv
+import copy
 import datetime
 import pandas as pd
 import streamlit as st
 from docx import Document
 from docx.shared import RGBColor
+from docx.oxml.ns import qn
 from openpyxl import load_workbook
 
 # =========================================================
@@ -25,7 +28,6 @@ MONTHS = {
     "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
 }
 
-# 内置飞行员名单
 PILOT_RAW = """P001,庚凡,gengfan@amber-aviation.com
 P002,张永一,zhangyongyi@amber-aviation.com
 P003,梅峰,fmei@amber-aviation.com
@@ -84,7 +86,6 @@ W270,杨涛,yang_tao2005@aliyun.com
 W272,"Andrew Nigel, KING",Andrew.king@aero.bombardier.com
 """
 
-# 内置机型对照表
 AIRCRAFT_TYPE_MAP = {
     "B3926": "LJ60",
     "B652R": "GLF4",
@@ -387,14 +388,44 @@ def find_text_match(approval, text_flights, city_to_icao):
 
 
 # =========================================================
-# docx 标红
+# docx 标红（保留原字体）
 # =========================================================
-def set_paragraph_runs(paragraph, text, red_parts):
-    p = paragraph._element
-    for child in list(p):
-        if child.tag.endswith("}r"):
-            p.remove(child)
+W_R = qn('w:r')
+W_RPR = qn('w:rPr')
+W_COLOR = qn('w:color')
+W_T = qn('w:t')
 
+
+def _set_run_red(run_element):
+    rPr = run_element.find(W_RPR)
+    if rPr is None:
+        rPr = run_element.makeelement(W_RPR, {})
+        run_element.insert(0, rPr)
+    for c in rPr.findall(W_COLOR):
+        rPr.remove(c)
+    color = rPr.makeelement(W_COLOR, {qn('w:val'): 'FF0000'})
+    rPr.append(color)
+
+
+def set_paragraph_runs(paragraph, text, red_parts):
+    """
+    在段落内标红指定文本，保留原字体格式：
+    按红/非红把段落切成片段，每个片段复制其源 run 的 XML（含字体），
+    仅对红色片段追加 w:color=FF0000。
+    """
+    if not red_parts:
+        return
+
+    runs = list(paragraph.runs)
+    if not runs:
+        return
+
+    full_text = "".join(r.text for r in runs)
+    if not full_text:
+        return
+    text = full_text
+
+    # 计算红色区间
     ranges = []
     for part in red_parts:
         if not part:
@@ -407,6 +438,9 @@ def set_paragraph_runs(paragraph, text, red_parts):
             ranges.append((idx, idx + len(part)))
             start = idx + len(part)
 
+    if not ranges:
+        return
+
     ranges.sort()
     merged = []
     for a, b in ranges:
@@ -415,15 +449,51 @@ def set_paragraph_runs(paragraph, text, red_parts):
         else:
             merged.append((a, b))
 
-    pos = 0
-    for a, b in merged:
-        if pos < a:
-            paragraph.add_run(text[pos:a])
-        run = paragraph.add_run(text[a:b])
-        run.font.color.rgb = RGBColor(0xFF, 0x00, 0x00)
-        pos = b
-    if pos < len(text):
-        paragraph.add_run(text[pos:])
+    def is_red(idx):
+        for a, b in merged:
+            if a <= idx < b:
+                return True
+        return False
+
+    # 每个字符对应的源 run
+    char_run = []
+    for r in runs:
+        char_run.extend([r] * len(r.text))
+
+    # 按红/非红切成连续片段
+    segments = []
+    i = 0
+    while i < len(text):
+        red_now = is_red(i)
+        j = i + 1
+        while j < len(text) and is_red(j) == red_now:
+            j += 1
+        segments.append((text[i:j], red_now, char_run[i]))
+        i = j
+
+    # 移除段落中现有 run
+    p_elem = paragraph._element
+    for r_elem in p_elem.findall(W_R):
+        p_elem.remove(r_elem)
+
+    # 按片段重建 run，复制源 run 的格式
+    for seg_text, red, src_run in segments:
+        new_r = copy.deepcopy(src_run._element)
+
+        # 清空原有 w:t
+        for t in new_r.findall(W_T):
+            new_r.remove(t)
+
+        # 写入新文本
+        t_elem = new_r.makeelement(W_T, {})
+        t_elem.text = seg_text
+        t_elem.set(qn('xml:space'), 'preserve')
+        new_r.append(t_elem)
+
+        if red:
+            _set_run_red(new_r)
+
+        p_elem.append(new_r)
 
 
 # =========================================================
@@ -463,18 +533,16 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         approval_dep_time = approval["dep_dt_bj"].strftime("%H:%M")
         approval_arr_time = approval["arr_dt_bj"].strftime("%H:%M")
 
-        # ---- 机型 ----
+        # 机型
         expected_type = AIRCRAFT_TYPE_MAP.get(approval["reg"])
         if expected_type is None:
             diffs.append(f"机型：注册号 {approval['reg']} 不在机型对照表中")
             red_parts.append(approval["type"])
         elif approval["type"] != expected_type:
-            diffs.append(
-                f"机型：批复 {approval['type']} vs 对照表 {expected_type}"
-            )
+            diffs.append(f"机型：批复 {approval['type']} vs 对照表 {expected_type}")
             red_parts.append(approval["type"])
 
-        # ---- Excel 相关 ----
+        # Excel
         if excel_row:
             if approval["dep"] != excel_row["dep"]:
                 diffs.append(f"起飞机场：批复 {approval['dep']} vs 计划 {excel_row['dep']}")
@@ -511,7 +579,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         else:
             diffs.append("未在 Excel 中找到匹配航段")
 
-        # ---- 中国籍 ----
+        # 中国籍
         if text_flight:
             all_cn = crew_all_chinese(text_flight["crew"], pilots)
             if all_cn is None:
@@ -545,6 +613,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         if diffs:
             approval_red_map[raw_text] = red_parts
 
+    # 标红
     for p in iter_doc_paragraphs(doc):
         raw_text = p.text.strip()
         if raw_text in approval_red_map:
@@ -578,31 +647,16 @@ with st.sidebar:
         "- 批复备注含“中国籍”则期望机组全为中国籍"
     )
 
-col1, col2 = st.columns([2, 1])
+text_input = st.text_area(
+    "③ 粘贴文本版航班信息",
+    height=320,
+    placeholder="例如：\nB8160 13:00 - 20:45\n马尔代夫马法鲁岛 - 北京大兴\nP083,PJZ005,C054,M041",
+)
 
-with col1:
-    text_input = st.text_area(
-        "③ 粘贴文本版航班信息",
-        height=320,
-        placeholder="例如：\nB8160 13:00 - 20:45\n马尔代夫马法鲁岛 - 北京大兴\nP083,PJZ005,C054,M041",
-    )
-
-with col2:
-    text_file = st.file_uploader(
-        "或上传 .txt（可选，粘贴优先）", type=["txt"], key="textfile"
-    )
-    st.caption("若同时提供，使用上方粘贴内容。")
-
-# 决定使用哪个文本
-if text_input.strip():
-    text_content = text_input
-elif text_file is not None:
-    text_content = text_file.getvalue().decode("utf-8-sig", errors="ignore")
-else:
-    text_content = ""
+text_content = text_input.strip()
 
 if not docx_file or not excel_file or not text_content:
-    st.info("👈 请上传批复汇总表、航段数据，并提供文本版航班信息。")
+    st.info("👈 请上传批复汇总表、航段数据，并粘贴文本版航班信息。")
     st.stop()
 
 if st.button("🚀 开始核对", type="primary"):
