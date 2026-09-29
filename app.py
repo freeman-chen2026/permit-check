@@ -6,13 +6,17 @@
 - 内置机型对照表
 - 标红时只改颜色，绝不动文本
   · 例外 1：待取消 → 段落末尾追加红色"待取消"
-  · 例外 2：待申请 → 在对应飞机行末尾追加红色批复行 + "待申请"
+  · 例外 2：待申请 → 按日期插入到该飞机批复队列中，+ 红色"待申请"
+             · 文本机组全中国籍 → 加" 中国籍"
+             · 文本含外籍机组 → 加" 外籍"
+             · 文本无机组/无法判断 → 加"（机组未定，需确认）"特别提醒
 - 内机/外机分别处理
 - 用途：调机/维修 -> N/M，其余 -> U/H
 - 用途三方交叉校验：批复 vs Excel vs 文本 F
 - 落地时间 30 分钟容差（仅当起飞时间一致时）
 - 起降机场组合在 Excel 中找不到 -> 待取消
-- Excel 有计划但批复没有且含 Z 机场 -> 追加 + 待申请
+- Excel 有计划但批复没有且含 Z 机场 -> 待申请（按日期插入）
+- 国籍写错 → 直接标红错误标签，差异描述简洁
 - 下载文件保持原文件名
 """
 
@@ -25,6 +29,7 @@ import pandas as pd
 import streamlit as st
 from docx import Document
 from docx.shared import RGBColor
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from openpyxl import load_workbook
 
@@ -143,7 +148,6 @@ def parse_hhmm(token):
 
 
 def parse_hhmm_str(s):
-    """'09:00' -> time(9,0)"""
     if not s:
         return None
     m = re.match(r"^(\d{1,2}):(\d{2})$", str(s).strip())
@@ -222,6 +226,12 @@ def load_pilots():
 
 
 def crew_all_chinese(crew_codes, pilots):
+    """
+    返回：
+      True  -> 全中国籍
+      False -> 含外籍
+      None  -> 名单不全或无法判断
+    """
     pilot_codes = [c.strip() for c in crew_codes if c.strip().startswith(("P", "W"))]
     if not pilot_codes:
         return None
@@ -470,7 +480,6 @@ def _make_run_like(src_run_elem, text, red):
 
 
 def set_paragraph_runs(paragraph, text, red_parts):
-    """标红指定文本，保留原字体"""
     if not red_parts:
         return
     runs = list(paragraph.runs)
@@ -551,7 +560,6 @@ def set_paragraph_runs(paragraph, text, red_parts):
 
 
 def append_red_text(paragraph, text):
-    """在段落末尾追加红色文本，字体沿用段落最后一个 run"""
     runs = list(paragraph.runs)
     p_elem = paragraph._element
     if runs:
@@ -571,10 +579,7 @@ def append_red_text(paragraph, text):
 
 
 def find_target_cell(doc, reg):
-    """找到该注册号批复应追加到的 cell"""
     reg_norm = reg.upper().replace("-", "")
-
-    # 1. 找包含该注册号批复的 cell
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -582,8 +587,6 @@ def find_target_cell(doc, reg):
                     ap = parse_approval_line(p.text.strip())
                     if ap and ap["reg"] == reg_norm:
                         return cell
-
-    # 2. 找标题 cell（飞机号本身）
     for table in doc.tables:
         for row_idx, row in enumerate(table.rows):
             for cell in row.cells:
@@ -593,47 +596,94 @@ def find_target_cell(doc, reg):
                         next_row = table.rows[row_idx + 1]
                         return next_row.cells[0]
                     return cell
-
     return None
 
 
-def append_paragraph_to_cell(cell, text):
-    """在 cell 末尾追加一个红色段落（沿用 cell 内已有段落的字体）"""
-    template_p = None
-    for p in cell.paragraphs:
+def find_global_template_paragraph(doc):
+    for p in iter_doc_paragraphs(doc):
         if parse_approval_line(p.text.strip()):
-            template_p = p
-            break
-    if template_p is None:
-        for p in cell.paragraphs:
-            if p.text.strip():
-                template_p = p
-                break
+            return p
+    return None
 
-    new_p = cell.add_paragraph()
+
+def _make_red_paragraph_element(text, template_p):
+    p_elem = OxmlElement('w:p')
 
     if template_p is not None:
         template_pPr = template_p._element.find(qn('w:pPr'))
         if template_pPr is not None:
-            new_p._element.insert(0, copy.deepcopy(template_pPr))
+            p_elem.append(copy.deepcopy(template_pPr))
 
-    run = new_p.add_run(text)
+    r_elem = OxmlElement('w:r')
 
+    rPr = None
     if template_p is not None:
-        template_rPr = None
         for r in template_p.runs:
-            rPr = r._element.find(W_RPR)
-            if rPr is not None:
-                template_rPr = rPr
+            rPr_src = r._element.find(W_RPR)
+            if rPr_src is not None:
+                rPr = copy.deepcopy(rPr_src)
                 break
-        if template_rPr is not None:
-            new_r_elem = run._element
-            for c in new_r_elem.findall(W_RPR):
-                new_r_elem.remove(c)
-            new_r_elem.insert(0, copy.deepcopy(template_rPr))
 
-    run.font.color.rgb = RGBColor(0xFF, 0x00, 0x00)
-    return new_p
+    if rPr is None:
+        rPr = OxmlElement('w:rPr')
+
+    for c in rPr.findall(W_COLOR):
+        rPr.remove(c)
+    color = OxmlElement('w:color')
+    color.set(qn('w:val'), 'FF0000')
+    rPr.append(color)
+
+    r_elem.append(rPr)
+
+    t_elem = OxmlElement('w:t')
+    t_elem.text = text
+    t_elem.set(qn('xml:space'), 'preserve')
+    r_elem.append(t_elem)
+
+    p_elem.append(r_elem)
+    return p_elem
+
+
+def _reorder_cell_with_pending(cell, pending_items, global_template_p):
+    existing_items = []
+    template_p = None
+    for p in cell.paragraphs:
+        raw = p.text.strip()
+        ap = parse_approval_line(raw)
+        if ap:
+            existing_items.append({
+                "type": "existing",
+                "dt": ap["dep_dt_bj"],
+                "element": p._element,
+            })
+            if template_p is None:
+                template_p = p
+
+    if template_p is None:
+        template_p = global_template_p
+
+    for item in pending_items:
+        existing_items.append({
+            "type": "pending",
+            "dt": item["dt"],
+            "text": item["text"],
+        })
+
+    existing_items.sort(key=lambda x: x["dt"])
+
+    tc = cell._tc
+    for p_elem in list(tc.findall(qn('w:p'))):
+        tc.remove(p_elem)
+
+    for i, item in enumerate(existing_items):
+        if item["type"] == "existing":
+            tc.append(item["element"])
+        else:
+            new_p = _make_red_paragraph_element(item["text"], template_p)
+            tc.append(new_p)
+
+        if i < len(existing_items) - 1:
+            tc.append(OxmlElement('w:p'))
 
 
 # =========================================================
@@ -656,11 +706,10 @@ def build_approval_text(excel_row, is_domestic):
         date_fmt = "%d%b%Y"
         second_field = AIRCRAFT_TYPE_MAP.get(reg, "")
     else:
-        # 北京时间 - 8 = 世界时
         dep_dt -= datetime.timedelta(hours=8)
         arr_dt -= datetime.timedelta(hours=8)
         date_fmt = "%d%b%y"
-        second_field = reg  # 外机第二字段为航班号，样例里用注册号
+        second_field = reg
 
     service = "N/M" if is_ferry_use(excel_row["use"]) else "U/H"
 
@@ -695,7 +744,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
     cancel_paragraphs = []
     approved_combos = set()
 
-    # ============ 第一遍：核对 docx 中已有批复 ============
+    # ===== 第一遍：核对 docx 已有批复 =====
     for p in iter_doc_paragraphs(doc):
         raw_text = p.text.strip()
         if not raw_text:
@@ -752,7 +801,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         approval_dep_time = approval["dep_dt_bj"].strftime("%H:%M")
         approval_arr_time = approval["arr_dt_bj"].strftime("%H:%M")
 
-        # 机型
+        # 机型（内机）
         if approval["is_domestic"]:
             expected_type = AIRCRAFT_TYPE_MAP.get(approval["reg"])
             if expected_type is None:
@@ -805,20 +854,29 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                     if approval["service"] not in red_parts:
                         red_parts.append(approval["service"])
 
-        # 中国籍：仅对 B 注册核对
+        # 国籍（内机）：写错直接标红错误标签
         if approval["is_domestic"]:
             if text_flight:
                 all_cn = crew_all_chinese(text_flight["crew"], pilots)
                 if all_cn is None:
-                    diffs.append("中国籍备注：机组名单不全，未核对")
+                    diffs.append("国籍标注：机组名单不全，无法核对")
                 else:
-                    actual_cn = "中国籍" in approval["remark"]
-                    if all_cn and not actual_cn:
-                        diffs.append("中国籍备注：机组全为中国籍，但批复未写“中国籍”")
-                        red_parts.append(approval["remark"])
-                    elif not all_cn and actual_cn:
-                        diffs.append("中国籍备注：机组含外籍飞行员，但批复写“中国籍”")
-                        red_parts.append("中国籍")
+                    has_cn = "中国籍" in approval["remark"]
+                    has_foreign = "外籍" in approval["remark"]
+                    if all_cn:
+                        # 期望：中国籍
+                        if has_foreign:
+                            diffs.append("国籍标注错误（应为中国籍）")
+                            red_parts.append("外籍")
+                        elif not has_cn:
+                            diffs.append("国籍未标注（应为中国籍）")
+                    else:
+                        # 期望：外籍
+                        if has_cn:
+                            diffs.append("国籍标注错误（应为外籍）")
+                            red_parts.append("中国籍")
+                        elif not has_foreign:
+                            diffs.append("国籍未标注（应为外籍）")
             else:
                 diffs.append("未找到对应文本版航班信息，无法核验机组")
 
@@ -861,8 +919,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         if raw_text in cancel_paragraphs:
             append_red_text(p, "  待取消")
 
-    # ============ 第二遍：找出待申请（Excel 有，批复没有）============
-    # 仅当起降机场至少一个以 Z 开头（中国境内机场）才考虑追加
+    # ===== 第二遍：待申请 =====
     pending_by_reg = {}
     for row in excel_rows:
         if not row["reg"]:
@@ -873,37 +930,95 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
             pending_by_reg.setdefault(row["reg"], []).append(row)
 
     pending_rows = []
+    global_template_p = find_global_template_paragraph(doc)
 
     for reg, rows in pending_by_reg.items():
         target_cell = find_target_cell(doc, reg)
         if target_cell is None:
             continue
+
         is_domestic = is_b_reg(reg)
+        items = []
         for row in rows:
             text = build_approval_text(row, is_domestic)
             if not text:
                 continue
-            append_paragraph_to_cell(target_cell, text + "  待申请")
+            dep_t = parse_hhmm_str(row["dep_time"])
+            if not row["dep_date"] or not dep_t:
+                continue
+            dep_dt_bj = datetime.datetime.combine(row["dep_date"], dep_t)
 
+            note_kind = ""
+
+            if is_domestic:
+                fake_ap = {
+                    "reg": reg,
+                    "dep": row["dep"],
+                    "arr": row["arr"],
+                    "dep_dt_bj": dep_dt_bj,
+                }
+                tf = find_text_match(fake_ap, text_flights, city_to_icao)
+
+                if tf is None or not tf["crew"]:
+                    note_kind = "机组未定"
+                else:
+                    all_cn = crew_all_chinese(tf["crew"], pilots)
+                    if all_cn is True:
+                        note_kind = "中国籍"
+                    elif all_cn is False:
+                        note_kind = "外籍"
+                    else:
+                        note_kind = "机组未定"
+
+            if note_kind == "机组未定":
+                full_text = text + "  待申请（机组未定，需确认）"
+            elif note_kind == "中国籍":
+                full_text = text + " 中国籍  待申请"
+            elif note_kind == "外籍":
+                full_text = text + " 外籍  待申请"
+            else:
+                full_text = text + "  待申请"
+
+            items.append({
+                "dt": dep_dt_bj,
+                "text": full_text,
+                "row": row,
+                "note_kind": note_kind,
+            })
+
+        if not items:
+            continue
+
+        _reorder_cell_with_pending(target_cell, items, global_template_p)
+
+        for item in items:
+            row = item["row"]
             if is_domestic:
                 bj_dep = row["dep_time"]
                 bj_arr = row["arr_time"]
             else:
-                dep_t = parse_hhmm_str(row["dep_time"])
-                arr_t = parse_hhmm_str(row["arr_time"])
-                if row["dep_date"] and dep_t:
-                    bj_dep = (datetime.datetime.combine(row["dep_date"], dep_t)
+                dep_t2 = parse_hhmm_str(row["dep_time"])
+                arr_t2 = parse_hhmm_str(row["arr_time"])
+                if row["dep_date"] and dep_t2:
+                    bj_dep = (datetime.datetime.combine(row["dep_date"], dep_t2)
                               + datetime.timedelta(hours=8)).strftime("%H:%M")
                 else:
                     bj_dep = ""
-                if row["arr_date"] and arr_t:
-                    bj_arr = (datetime.datetime.combine(row["arr_date"], arr_t)
+                if row["arr_date"] and arr_t2:
+                    bj_arr = (datetime.datetime.combine(row["arr_date"], arr_t2)
                               + datetime.timedelta(hours=8)).strftime("%H:%M")
                 else:
                     bj_arr = ""
 
+            if item["note_kind"] == "机组未定":
+                remark = "待申请（机组未定，需确认）"
+                diff_text = "Excel 有计划，批复汇总表缺失；机组信息未定，需确认中外籍"
+            else:
+                remark = "待申请"
+                diff_text = "Excel 有计划，批复汇总表缺失"
+
             pending_rows.append({
-                "批复": text,
+                "批复": item["text"],
                 "飞机号": reg,
                 "航班号": reg if not is_domestic else "",
                 "机型": AIRCRAFT_TYPE_MAP.get(reg, "") if is_domestic else "",
@@ -917,9 +1032,9 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                 "Excel 计划落地": row["arr_time"],
                 "Excel 出发地": row["dep"],
                 "Excel 到达地": row["arr"],
-                "差异": "Excel 有计划，批复汇总表缺失",
+                "差异": diff_text,
                 "是否一致": "否",
-                "备注": "待申请",
+                "备注": remark,
             })
 
     result_rows.extend(pending_rows)
@@ -945,16 +1060,15 @@ with st.sidebar:
     st.markdown(
         "**说明**\n"
         "- 飞行员名单、机型对照表已内置\n"
-        "- **用途规则**：Excel 为 `调机` / `维修` → 应为 `N/M`；其余 → 应为 `U/H`\n"
+        "- **用途规则**：Excel 为 `调机` / `维修` → `N/M`；其余 → `U/H`\n"
         "- **用途三方交叉校验**：批复 vs Excel vs 文本 F\n"
         "- **落地时间容差**：起飞时间一致时，落地时间差 ≤ 30 分钟视为一致\n"
-        "- **待取消**：批复的起降机场组合在 Excel 中找不到 → 段落末尾追加红色“待取消”\n"
-        "- **待申请**：Excel 有计划、批复汇总表无，且起降机场至少一个 Z 开头 → "
-        "在对应飞机行末尾追加批复行 + 红色“待申请”\n"
-        "- 其他情况下 docx 只改颜色，绝不动文本\n"
-        "- **内机**：`注册号 机型 起飞机场+时间 到达时间+到达机场 ON 日期 U/H|N/M`\n"
-        "- **外机**：`注册号 航班号 起飞机场+时间 到达时间+到达机场 ON 日期 U/H|N/M`\n"
-        "- 外机不核对机型、不核对中国籍机组\n"
+        "- **待取消**：批复的起降机场组合在 Excel 找不到 → 段落末尾追加红色“待取消”\n"
+        "- **待申请**：Excel 有、批复无，且起降机场至少一个 Z 开头 → 按日期插入到该飞机批复中\n"
+        "  - 文本机组全中国籍 → 加 `中国籍`\n"
+        "  - 文本含外籍机组 → 加 `外籍`\n"
+        "  - **文本无机组/查不到** → 加 `（机组未定，需确认）`，需特别留意\n"
+        "- **国籍核对**：批复与文本机组国籍不符 → 直接标红批复里的 `中国籍`/`外籍` 标签\n"
         "- B 注册批复时间按北京时间；其他按世界时 UTC +8\n"
         "- 文本里单独的 `F` 属于**下一段**航班"
     )
@@ -1009,6 +1123,8 @@ if st.button("🚀 开始核对", type="primary"):
     else:
         def highlight(row):
             if row["是否一致"] == "否":
+                if "机组未定" in str(row["备注"]):
+                    return ["background-color: #fff3cd"] * len(row)
                 return ["background-color: #ffe5e5"] * len(row)
             return [""] * len(row)
 
@@ -1024,10 +1140,17 @@ if st.button("🚀 开始核对", type="primary"):
             st.success("✅ 所有批复与计划一致，未发现差异。")
         else:
             for _, r in diffs_df.iterrows():
-                note_html = (
-                    f" <span style='color:red;font-weight:bold'>【{r['备注']}】</span>"
-                    if r["备注"] else ""
-                )
+                if "机组未定" in str(r["备注"]):
+                    note_html = (
+                        " <span style='color:#d97706;font-weight:bold'>"
+                        f"【{r['备注']}】</span>"
+                    )
+                elif r["备注"]:
+                    note_html = (
+                        f" <span style='color:red;font-weight:bold'>【{r['备注']}】</span>"
+                    )
+                else:
+                    note_html = ""
                 st.markdown(f"**`{r['批复']}`**{note_html}", unsafe_allow_html=True)
                 for line in r["差异"].split("；"):
                     st.markdown(f"- {line}")
