@@ -2,24 +2,12 @@
 """
 国内批复核对工具 - Streamlit 版本
 
-核心匹配规则：
-- Excel 匹配：注册号 + 起降机场 + 日期
-  · 同日优先（按起飞时间最接近）
-  · 跨天宽容：日期差 1 天且真实时差 ≤ 10 小时
-  · 日期差 ≥ 2 天 → 不匹配 → 待取消
-- 文本匹配：注册号 + 起降城市 完全一致；一条只能用一次
-  · 文本未提供该航段 → 备注「待确认机组」
-- Excel 有但未被任何批复使用 → 待申请
+三种判定结果：
+- "是"     ：完全一致
+- "否"     ：有实质差异（时间/机场/用途/国籍/待取消/待变更）
+- "待确认" ：待确认机组（仅信息提示，不算差异）
 
-时间判定（real_dep_diff = 批复 - Excel，考虑日期）：
-- == 0 → OK
-- -600 ≤ diff < 0 → 标绿
-- > 0 → 待变更
-- < -600 → 标红
-
-判定"是否一致"：
-- diffs 非空 OR note_parts 非空 → 否
-- 两者都空 → 是
+其余规则同前。
 """
 
 import io
@@ -817,7 +805,8 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         red_parts = []
         green_parts = []
         diffs = []
-        note_parts = []
+        note_parts = []       # 真实差异备注：待取消、待变更
+        info_note = ""        # 信息提示：待确认机组
 
         excel_row = find_excel_match(approval, excel_rows, used_excel)
 
@@ -944,12 +933,13 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                 if approval["service"] not in red_parts:
                     red_parts.append(approval["service"])
 
-        # 国籍
+        # 国籍（内机）
         if approval["is_domestic"]:
             if text_flight:
                 all_cn = crew_all_chinese(text_flight["crew"], pilots)
                 if all_cn is None:
-                    diffs.append("国籍标注：机组名单不全，无法核对")
+                    # 机组信息不全 → 信息提示，不算差异
+                    info_note = "待确认机组"
                 else:
                     has_cn = "中国籍" in approval["remark"]
                     has_foreign = "外籍" in approval["remark"]
@@ -966,18 +956,28 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                         elif not has_foreign:
                             diffs.append("国籍未标注（应为外籍）")
             else:
-                # 文本未提供该航段 → 待确认机组
-                note_parts.append("待确认机组")
+                # 文本未提供该航段 → 信息提示，不算差异
+                info_note = "待确认机组"
 
         if raw_text in change_paragraphs:
             note_parts.append("待变更")
 
+        # 组合备注
+        final_notes = list(note_parts)
+        if info_note:
+            final_notes.append(info_note)
+
+        # 判定结果：三态
+        if diffs or note_parts:
+            consistency = "否"
+        elif info_note:
+            consistency = "待确认"
+        else:
+            consistency = "是"
+
         text_ferry_label = ""
         if text_flight is not None:
             text_ferry_label = "调机(F)" if text_flight.get("is_ferry", False) else "载客(无F)"
-
-        # 关键修复：note_parts 非空也视为"否"
-        has_issue = bool(diffs) or bool(note_parts)
 
         result_rows.append({
             "批复": raw_text,
@@ -995,8 +995,8 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
             "Excel 出发地": excel_row["dep"] if excel_row else "",
             "Excel 到达地": excel_row["arr"] if excel_row else "",
             "差异": "；".join(diffs) if diffs else "无",
-            "是否一致": "否" if has_issue else "是",
-            "备注": "；".join(note_parts),
+            "是否一致": consistency,
+            "备注": "；".join(final_notes),
         })
 
         if red_parts:
@@ -1169,11 +1169,13 @@ with st.sidebar:
         "- 飞行员名单、机型对照表已内置\n"
         "- **Excel 匹配**：注册号 + 起降机场 + 日期（同日优先；其次差 1 天且真实时差 ≤ 10 小时）\n"
         "- **文本匹配**：注册号 + 起降城市 完全一致（一条只能用一次）\n"
-        "  · 文本未提供该航段 → 备注「待确认机组」\n"
+        "- **三种结果**：\n"
+        "  · `是`：完全一致\n"
+        "  · `否`：有实质差异（时间/机场/用途/国籍/待取消/待变更）\n"
+        "  · `待确认`：机组信息不全（仅提示，不算差异）\n"
         "- **待取消**：Excel 里找不到匹配（含 ±1 天宽容）→ 追加红色“待取消”\n"
         "- **待申请**：Excel 有但未被任何批复使用（含 Z 机场）→ 按日期插入\n"
         "- **用途规则**：Excel 为 `调机` / `维修` → `N/M`；其余 → `U/H`\n"
-        "- **飞行时长**：差 ≤ 30 分钟 → OK；> 30 分钟 → 报差异\n"
         "- **起飞时间**（考虑日期）：早 ≤ 10h → 标绿；晚于 Excel → 报差异 + 待变更；早 > 10h → 标红\n"
         "- **落地时间**（考虑日期）：早 ≤ 10h（且起飞正常）→ 标绿"
     )
@@ -1211,20 +1213,22 @@ if st.button("🚀 开始核对", type="primary"):
     df = pd.DataFrame(rows)
     total = len(df)
     diff_count = (df["是否一致"] == "否").sum() if total else 0
+    pending_count = (df["是否一致"] == "待确认").sum() if total else 0
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("批复条数", total)
-    c2.metric("一致", total - diff_count)
+    c2.metric("一致", total - diff_count - pending_count)
     c3.metric("有差异", diff_count)
+    c4.metric("待确认", pending_count)
 
     st.subheader("📋 核对结果")
     if total == 0:
         st.warning("未在 docx 中识别到任何批复行。")
     else:
         def highlight(row):
+            if row["是否一致"] == "待确认":
+                return ["background-color: #fff3cd"] * len(row)
             if row["是否一致"] == "否":
-                if "待确认机组" in str(row["备注"]):
-                    return ["background-color: #fff3cd"] * len(row)
                 if "待变更" in str(row["备注"]):
                     return ["background-color: #e5f0ff"] * len(row)
                 return ["background-color: #ffe5e5"] * len(row)
@@ -1237,12 +1241,13 @@ if st.button("🚀 开始核对", type="primary"):
         )
 
         st.subheader("🚨 差异明细")
-        diffs_df = df[df["是否一致"] == "否"][["批复", "差异", "备注"]]
+        # 包含 "否" 和 "待确认"
+        diffs_df = df[df["是否一致"] != "是"][["批复", "差异", "备注", "是否一致"]]
         if diffs_df.empty:
             st.success("✅ 所有批复与计划一致，未发现差异。")
         else:
             for _, r in diffs_df.iterrows():
-                if "待确认机组" in str(r["备注"]):
+                if r["是否一致"] == "待确认":
                     note_html = (
                         " <span style='color:#d97706;font-weight:bold'>"
                         f"【{r['备注']}】</span>"
