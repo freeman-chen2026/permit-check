@@ -10,20 +10,16 @@
 - 文本匹配：注册号 + 起降城市 完全一致；一条只能用一次
   · 文本未提供该航段 → 备注「待确认机组」
 - Excel 有但未被任何批复使用 → 待申请
-- 文本匹配不到 → 输出"机组未定，需确认"
 
-时间判定（用真实时差 real_dep_diff = 批复 - Excel，考虑日期）：
-- real_dep_diff == 0 → OK
-- -600 ≤ real_dep_diff < 0（批复早 ≤ 10h）→ 标绿
-- real_dep_diff > 0（批复晚）→ 待变更
-- real_dep_diff < -600（批复早 > 10h）→ 标红
+时间判定（real_dep_diff = 批复 - Excel，考虑日期）：
+- == 0 → OK
+- -600 ≤ diff < 0 → 标绿
+- > 0 → 待变更
+- < -600 → 标红
 
-其他：
-- 用途：调机/维修 -> N/M，其余 -> U/H
-- 飞行时长：差 ≤ 30 分钟 → OK
-- 落地时间：早 ≤ 10h（且起飞正常）→ 标绿
-- 标红时只改颜色，绝不动文本（除待取消/待申请/待变更追加文字）
-- 下载文件保持原文件名
+判定"是否一致"：
+- diffs 非空 OR note_parts 非空 → 否
+- 两者都空 → 是
 """
 
 import io
@@ -980,6 +976,9 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         if text_flight is not None:
             text_ferry_label = "调机(F)" if text_flight.get("is_ferry", False) else "载客(无F)"
 
+        # 关键修复：note_parts 非空也视为"否"
+        has_issue = bool(diffs) or bool(note_parts)
+
         result_rows.append({
             "批复": raw_text,
             "飞机号": approval["reg"],
@@ -996,7 +995,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
             "Excel 出发地": excel_row["dep"] if excel_row else "",
             "Excel 到达地": excel_row["arr"] if excel_row else "",
             "差异": "；".join(diffs) if diffs else "无",
-            "是否一致": "否" if diffs else "是",
+            "是否一致": "否" if has_issue else "是",
             "备注": "；".join(note_parts),
         })
 
@@ -1260,8 +1259,9 @@ if st.button("🚀 开始核对", type="primary"):
                 else:
                     note_html = ""
                 st.markdown(f"**`{r['批复']}`**{note_html}", unsafe_allow_html=True)
-                for line in r["差异"].split("；"):
-                    st.markdown(f"- {line}")
+                if r["差异"] != "无":
+                    for line in r["差异"].split("；"):
+                        st.markdown(f"- {line}")
 
     st.subheader("📥 下载标红后的批复汇总表")
     st.download_button(
