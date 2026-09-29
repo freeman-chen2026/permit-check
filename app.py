@@ -6,6 +6,7 @@
 - 内置机型对照表
 - 标红时只改颜色，绝不动文本
 - 内机/外机分别处理
+- 用途：调机/维修 -> N/M，其余 -> U/H
 """
 
 import io
@@ -111,6 +112,9 @@ AIRCRAFT_TYPE_MAP = {
     "B65AP": "GLF4",
 }
 
+# 视为调机的用途关键词（其余一律视为载客）
+FERRY_KEYWORDS = ("调机", "维修")
+
 st.set_page_config(page_title="国内批复核对工具", page_icon="✈️", layout="wide")
 
 
@@ -213,6 +217,11 @@ def crew_all_chinese(crew_codes, pilots):
     return True
 
 
+def is_ferry_use(use_text):
+    """调机/维修 -> True；其余（载客、共享租赁、展示飞行、包机、小时卡…）-> False"""
+    return any(k in use_text for k in FERRY_KEYWORDS)
+
+
 # =========================================================
 # 解析批复
 # =========================================================
@@ -241,7 +250,6 @@ def parse_approval_line(text):
     date_raw = m.group("date").upper()
     rest = m.group("rest").strip()
 
-    # B 注册：第二字段是机型；外机：第二字段是航班号
     if is_b_reg(reg):
         ac_type = second
         flight_no = ""
@@ -321,7 +329,7 @@ def load_excel_rows_from_bytes(data: bytes):
 
 
 # =========================================================
-# 文本航班信息
+# 文本航班信息（支持 F 标记）
 # =========================================================
 FLIGHT_HEADER_RE = re.compile(
     r"^([A-Z0-9]+)\s+(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})(?:\s*\+1)?$"
@@ -332,8 +340,23 @@ def load_text_flights(text: str):
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     flights = []
     i = 0
+    pending_f = False  # 上一行是单独的 F 标记
+
     while i < len(lines):
-        m = FLIGHT_HEADER_RE.match(lines[i])
+        line = lines[i]
+
+        # 单独的 F 行 -> 下一段是调机
+        if line.upper() == "F":
+            pending_f = True
+            i += 1
+            continue
+
+        # TBA / 其他标记行：跳过（不影响解析）
+        if line.upper() in ("TBA",):
+            i += 1
+            continue
+
+        m = FLIGHT_HEADER_RE.match(line)
         if m:
             reg = m.group(1).upper()
             dep_time, arr_time = m.group(2), m.group(3)
@@ -352,7 +375,9 @@ def load_text_flights(text: str):
                         "dep_city": cm.group(1).strip(),
                         "arr_city": cm.group(2).strip(),
                         "crew": crew,
+                        "is_ferry": pending_f,
                     })
+                    pending_f = False
                     i += 3
                     continue
         i += 1
@@ -413,7 +438,6 @@ W_T = qn('w:t')
 
 
 def _set_run_red(run_element):
-    """给 run 的 rPr 增加红色，保留其他属性"""
     rPr = run_element.find(W_RPR)
     if rPr is None:
         rPr = run_element.makeelement(W_RPR, {})
@@ -425,9 +449,7 @@ def _set_run_red(run_element):
 
 
 def _make_run_like(src_run_elem, text, red):
-    """复制 src_run_elem 的 XML（含字体），只把文本换成 text；red=True 时加红色"""
     new_r = copy.deepcopy(src_run_elem)
-    # 删除所有 w:t，保留其它子节点（如 w:rPr）
     for t in new_r.findall(W_T):
         new_r.remove(t)
     t = new_r.makeelement(W_T, {})
@@ -440,15 +462,8 @@ def _make_run_like(src_run_elem, text, red):
 
 
 def set_paragraph_runs(paragraph, text, red_parts):
-    """
-    仅对需要标红的部分修改颜色：
-    - 不含红色的 run 原封不动
-    - 整个 run 都是红色的，直接给该 run 加红
-    - 部分红色的 run，才拆分；拆出的片段复制原 run 格式
-    """
     if not red_parts:
         return
-
     runs = list(paragraph.runs)
     if not runs:
         return
@@ -457,7 +472,6 @@ def set_paragraph_runs(paragraph, text, red_parts):
     if not full_text:
         return
 
-    # 计算段落内红色字符区间
     ranges = []
     for part in red_parts:
         if not part:
@@ -492,28 +506,23 @@ def set_paragraph_runs(paragraph, text, red_parts):
         r_text = run.text
         if not r_text:
             continue
-
         r_start = pos
         r_len = len(r_text)
-
-        # 该 run 的红色状态
         red_flags = [is_red(r_start + i) for i in range(r_len)]
+
         if not any(red_flags):
             pos += r_len
             continue
 
         if all(red_flags):
-            # 整个 run 标红，直接改颜色，不动文本结构
             _set_run_red(run._element)
             pos += r_len
             continue
 
-        # 部分红色：拆分这个 run
         run_elem = run._element
         parent = run_elem.getparent()
         idx_in_parent = list(parent).index(run_elem)
 
-        # 切成片段
         pieces = []
         i = 0
         while i < r_len:
@@ -524,7 +533,6 @@ def set_paragraph_runs(paragraph, text, red_parts):
             pieces.append((r_text[i:j], red_now))
             i = j
 
-        # 移除原 run，按顺序插入新片段
         parent.remove(run_elem)
         for k, (seg, red) in enumerate(pieces):
             new_r = _make_run_like(run_elem, seg, red)
@@ -580,7 +588,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                 diffs.append(f"机型：批复 {approval['type']} vs 对照表 {expected_type}")
                 red_parts.append(approval["type"])
 
-        # ---- Excel 比对（内机、外机都做） ----
+        # ---- Excel 比对 ----
         if excel_row:
             if approval["dep"] != excel_row["dep"]:
                 diffs.append(f"起飞机场：批复 {approval['dep']} vs 计划 {excel_row['dep']}")
@@ -604,14 +612,12 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                 )
                 red_parts.append(approval["date_raw"])
 
-            expected_use = ""
-            if approval["service"] == "U/H":
-                expected_use = "载客"
-            elif approval["service"] == "N/M":
-                expected_use = "调机"
-            if expected_use and expected_use not in excel_row["use"]:
+            # ---- 用途：Excel 是调机/维修 -> N/M，其余 -> U/H ----
+            expected_service = "N/M" if is_ferry_use(excel_row["use"]) else "U/H"
+            if approval["service"] != expected_service:
                 diffs.append(
-                    f"用途：批复 {approval['service']} -> {expected_use} vs 计划 {excel_row['use']}"
+                    f"用途：批复 {approval['service']} vs 计划 {excel_row['use']}"
+                    f"（应为 {expected_service}）"
                 )
                 red_parts.append(approval["service"])
         else:
@@ -638,12 +644,12 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
             "批复": raw_text,
             "飞机号": approval["reg"],
             "航班号": approval["flight_no"] if not approval["is_domestic"] else "",
-            "机型": approval["type"] if approval["is_domestic"]
-                    else "",
+            "机型": approval["type"] if approval["is_domestic"] else "",
             "内/外机": "内机" if approval["is_domestic"] else "外机",
             "批复起飞(北京时)": approval_dep_time,
             "批复落地(北京时)": approval_arr_time,
             "批复日期": approval["dep_dt_bj"].date().isoformat(),
+            "Excel 用途": excel_row["use"] if excel_row else "",
             "Excel 计划起飞": excel_row["dep_time"] if excel_row else "",
             "Excel 计划落地": excel_row["arr_time"] if excel_row else "",
             "Excel 出发地": excel_row["dep"] if excel_row else "",
@@ -680,19 +686,25 @@ with st.sidebar:
     st.markdown("---")
     st.markdown(
         "**说明**\n"
-        "- 飞行员名单已内置，无需上传\n"
-        "- 机型对照表已内置，只对 B 注册核对\n"
+        "- 飞行员名单、机型对照表已内置\n"
+        "- **用途规则**：Excel 为 `调机` / `维修` → 批复应为 `N/M`；"
+        "其余（载客、共享租赁、展示飞行、包机、小时卡、悦享家、置换…）→ 批复应为 `U/H`\n"
         "- **内机**：`注册号 机型 起飞机场+时间 到达时间+到达机场 ON 日期 U/H|N/M`\n"
         "- **外机**：`注册号 航班号 起飞机场+时间 到达时间+到达机场 ON 日期 U/H|N/M`\n"
         "- 外机不核对机型、不核对中国籍机组\n"
-        "- B 注册批复时间按北京时间；其他按世界时 UTC +8\n"
-        "- `U/H` → 载客，`N/M` → 调机"
+        "- B 注册批复时间按北京时间；其他按世界时 UTC +8"
     )
 
 text_input = st.text_area(
     "③ 粘贴文本版航班信息",
     height=320,
-    placeholder="例如：\nB8160 13:00 - 20:45\n马尔代夫马法鲁岛 - 北京大兴\nP083,PJZ005,C054,M041",
+    placeholder=(
+        "例如：\n"
+        "F\n"
+        "B652Q 13:45 - 16:30\n"
+        "上海虹桥 - 成都双流\n"
+        "P072,P071,C050,M021"
+    ),
 )
 
 text_content = text_input.strip()
