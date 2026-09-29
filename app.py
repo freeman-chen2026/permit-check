@@ -7,15 +7,17 @@
 - 标红时只改颜色，绝不动文本
   · 例外 1：待取消 → 段落末尾追加红色"待取消"
   · 例外 2：待申请 → 按日期插入到该飞机批复队列中，+ 红色"待申请"
+  · 例外 3：待变更 → 段落末尾追加红色"待变更"
 - 内机/外机分别处理
 - 用途：调机/维修 -> N/M，其余 -> U/H
 - 用途三方交叉校验：批复 vs Excel vs 文本 F（漏 F / 多 F 均提示）
-- 时间核对以【飞行时长】为准：
+- 时间核对：
   · 飞行时长差 ≤ 30 分钟 → OK
   · 飞行时长差 > 30 分钟 → 报差异，标红落地时间
-- 时间偏移（早于 Excel）：
-  · 起飞早 ≤ 2 小时 → 标绿（提示，无需重新申请）
-  · 落地早 ≤ 2 小时 → 标绿
+  · 起飞早于 Excel 且 ≤ 2 小时 → 标绿（提示）
+  · 起飞晚于 Excel → 报差异 + 追加"待变更"（需重新申请）
+  · 起飞早于 Excel > 2 小时 → 报差异
+  · 落地早于 Excel 且 ≤ 2 小时（且起飞正常）→ 标绿
 - 起降机场组合在 Excel 中找不到 -> 待取消
 - Excel 有计划但批复没有（按日期判重）-> 待申请
 - 国籍写错 → 直接标红错误标签
@@ -244,7 +246,6 @@ def flight_duration_minutes(dep_t, arr_t):
 
 
 def fmt_duration(mins):
-    """分钟数格式化为 H:MM"""
     if mins is None:
         return ""
     sign = "-" if mins < 0 else ""
@@ -768,7 +769,8 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
     result_rows = []
     approval_red_map = {}
     approval_green_map = {}
-    cancel_paragraphs = []
+    cancel_paragraphs = set()
+    change_paragraphs = set()
     approved_index = {}
 
     # ===== 第一遍：核对 docx 已有批复 =====
@@ -788,7 +790,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         red_parts = []
         green_parts = []
         diffs = []
-        cancel_note = ""
+        note_parts = []
 
         airport_exists = any(
             r["reg"] == approval["reg"]
@@ -798,7 +800,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         )
 
         if not airport_exists:
-            cancel_note = "待取消"
+            note_parts.append("待取消")
             red_parts.append(approval["dep"])
             red_parts.append(approval["arr"])
 
@@ -819,10 +821,10 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                 "Excel 到达地": "",
                 "差异": f"起降机场组合 {approval['dep']}→{approval['arr']} 在 Excel 中不存在",
                 "是否一致": "否",
-                "备注": cancel_note,
+                "备注": "待取消",
             })
             approval_red_map[raw_text] = red_parts
-            cancel_paragraphs.append(raw_text)
+            cancel_paragraphs.add(raw_text)
             continue
 
         excel_row = find_excel_match(approval, excel_rows)
@@ -841,10 +843,9 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                 red_parts.append(approval["type"])
 
         if excel_row:
-            # ===== 飞行时长核对（核心）=====
+            # ===== 飞行时长 =====
             ap_dur = flight_duration_minutes(approval_dep_time, approval_arr_time)
             xl_dur = flight_duration_minutes(excel_row["dep_time"], excel_row["arr_time"])
-
             dur_diff = None
             if ap_dur is not None and xl_dur is not None:
                 dur_diff = ap_dur - xl_dur
@@ -855,33 +856,39 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                     )
                     red_parts.append(approval["arr_time_raw"])
 
-            # ===== 起飞时间偏移提示 =====
+            # ===== 起飞时间 =====
             dep_exact = (approval_dep_time == excel_row["dep_time"])
-            if not dep_exact:
+            dep_ok = False
+            if dep_exact:
+                dep_ok = True
+            else:
                 dep_diff = time_diff_signed(approval_dep_time, excel_row["dep_time"])
                 if dep_diff is not None and -120 <= dep_diff < 0:
-                    # 早 ≤ 2h，标绿提示
+                    # 早 ≤ 2h → 标绿
+                    dep_ok = True
                     green_parts.append(approval["dep_time_raw"])
+                elif dep_diff is not None and dep_diff > 0:
+                    # 晚于 Excel → 待变更
+                    dep_ok = False
+                    diffs.append(
+                        f"起飞时间：批复 {approval_dep_time} 晚于计划 {excel_row['dep_time']}，需重新申请"
+                    )
+                    red_parts.append(approval["dep_time_raw"])
+                    change_paragraphs.add(raw_text)
                 else:
-                    # 其他情况：只有飞行时长已经报差异时不重复报
-                    if dur_diff is None or abs(dur_diff) <= 30:
-                        diffs.append(
-                            f"起飞时间：批复 {approval_dep_time} vs 计划 {excel_row['dep_time']}"
-                        )
-                        red_parts.append(approval["dep_time_raw"])
+                    # 早 > 2h
+                    dep_ok = False
+                    diffs.append(
+                        f"起飞时间：批复 {approval_dep_time} vs 计划 {excel_row['dep_time']}"
+                    )
+                    red_parts.append(approval["dep_time_raw"])
 
-            # ===== 落地时间偏移提示 =====
+            # ===== 落地时间（早 ≤ 2h 且起飞正常时标绿）=====
             arr_exact = (approval_arr_time == excel_row["arr_time"])
             if not arr_exact:
                 arr_diff = time_diff_signed(approval_arr_time, excel_row["arr_time"])
-                if arr_diff is not None and -120 <= arr_diff < 0:
+                if arr_diff is not None and -120 <= arr_diff < 0 and dep_ok:
                     green_parts.append(approval["arr_time_raw"])
-                else:
-                    if dur_diff is None or abs(dur_diff) <= 30:
-                        diffs.append(
-                            f"落地时间：批复 {approval_arr_time} vs 计划 {excel_row['arr_time']}"
-                        )
-                        red_parts.append(approval["arr_time_raw"])
 
             # 日期
             if excel_row["dep_date"] and approval["dep_dt_bj"].date() != excel_row["dep_date"]:
@@ -941,6 +948,9 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
             else:
                 diffs.append("未找到对应文本版航班信息，无法核验机组")
 
+        if raw_text in change_paragraphs:
+            note_parts.append("待变更")
+
         text_ferry_label = ""
         if text_flight is not None:
             text_ferry_label = "调机(F)" if text_flight.get("is_ferry", False) else "载客(无F)"
@@ -962,7 +972,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
             "Excel 到达地": excel_row["arr"] if excel_row else "",
             "差异": "；".join(diffs) if diffs else "无",
             "是否一致": "否" if diffs else "是",
-            "备注": cancel_note,
+            "备注": "；".join(note_parts),
         })
 
         if red_parts:
@@ -981,11 +991,13 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                 [(GREEN, green), (RED, red)]
             )
 
-    # 追加"待取消"
+    # 追加"待取消" / "待变更"
     for p in iter_doc_paragraphs(doc):
         raw_text = p.text.strip()
         if raw_text in cancel_paragraphs:
             append_red_text(p, "  待取消")
+        elif raw_text in change_paragraphs:
+            append_red_text(p, "  待变更")
 
     # ===== 第二遍：待申请 =====
     pending_by_reg = {}
@@ -1133,15 +1145,14 @@ with st.sidebar:
         "**说明**\n"
         "- 飞行员名单、机型对照表已内置\n"
         "- **用途规则**：Excel 为 `调机` / `维修` → `N/M`；其余 → `U/H`\n"
-        "- **用途三方交叉校验**：批复 vs Excel vs 文本 F，漏 F / 多 F 均提示\n"
-        "- **飞行时长（核心）**：批复 vs Excel，差 ≤ 30 分钟 → OK；差 > 30 分钟 → 报差异，标红落地时间\n"
-        "- **起飞时间**：早于 Excel 且 ≤ 2 小时 → 视为正常，**标绿提示**\n"
-        "- **落地时间**：早于 Excel 且 ≤ 2 小时 → 视为正常，**标绿提示**\n"
-        "- **待取消**：批复的起降机场组合在 Excel 找不到 → 段落末尾追加红色“待取消”\n"
-        "- **待申请**：Excel 有、批复无该航段日期（含 Z 机场）→ 按日期插入到该飞机批复中\n"
+        "- **用途三方交叉校验**：批复 vs Excel vs 文本 F\n"
+        "- **飞行时长**：差 ≤ 30 分钟 → OK；差 > 30 分钟 → 报差异\n"
+        "- **起飞时间**：早 ≤ 2h → 标绿；晚于 Excel → 报差异 + 追加 **待变更**\n"
+        "- **落地时间**：起飞正常且早 ≤ 2h → 标绿\n"
+        "- **待取消**：批复的起降机场组合在 Excel 找不到 → 追加红色“待取消”\n"
+        "- **待申请**：Excel 有、批复无该航段日期（含 Z 机场）→ 按日期插入\n"
         "- **国籍核对**：批复与文本机组国籍不符 → 标红批复里的标签\n"
-        "- B 注册批复时间按北京时间；其他按世界时 UTC +8\n"
-        "- 文本里单独的 `F` 属于**下一段**航班"
+        "- B 注册批复时间按北京时间；其他按世界时 UTC +8"
     )
 
 text_input = st.text_area(
@@ -1196,6 +1207,8 @@ if st.button("🚀 开始核对", type="primary"):
             if row["是否一致"] == "否":
                 if "机组未定" in str(row["备注"]):
                     return ["background-color: #fff3cd"] * len(row)
+                if "待变更" in str(row["备注"]):
+                    return ["background-color: #e5f0ff"] * len(row)
                 return ["background-color: #ffe5e5"] * len(row)
             return [""] * len(row)
 
@@ -1214,6 +1227,11 @@ if st.button("🚀 开始核对", type="primary"):
                 if "机组未定" in str(r["备注"]):
                     note_html = (
                         " <span style='color:#d97706;font-weight:bold'>"
+                        f"【{r['备注']}】</span>"
+                    )
+                elif "待变更" in str(r["备注"]):
+                    note_html = (
+                        " <span style='color:#0066cc;font-weight:bold'>"
                         f"【{r['备注']}】</span>"
                     )
                 elif r["备注"]:
