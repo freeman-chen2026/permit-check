@@ -10,7 +10,12 @@
 - 内机/外机分别处理
 - 用途：调机/维修 -> N/M，其余 -> U/H
 - 用途三方交叉校验：批复 vs Excel vs 文本 F（漏 F / 多 F 均提示）
-- 落地时间 30 分钟容差（仅当起飞时间一致时）
+- 时间核对以【飞行时长】为准：
+  · 飞行时长差 ≤ 30 分钟 → OK
+  · 飞行时长差 > 30 分钟 → 报差异，标红落地时间
+- 时间偏移（早于 Excel）：
+  · 起飞早 ≤ 2 小时 → 标绿（提示，无需重新申请）
+  · 落地早 ≤ 2 小时 → 标绿
 - 起降机场组合在 Excel 中找不到 -> 待取消
 - Excel 有计划但批复没有（按日期判重）-> 待申请
 - 国籍写错 → 直接标红错误标签
@@ -39,6 +44,9 @@ MONTHS = {
     "MAY": 5, "JUN": 6, "JUL": 7, "AUG": 8,
     "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
 }
+
+RED = "FF0000"
+GREEN = "00B050"
 
 PILOT_RAW = """P001,庚凡,gengfan@amber-aviation.com
 P002,张永一,zhangyongyi@amber-aviation.com
@@ -205,6 +213,43 @@ def time_diff_minutes(t1, t2):
         return abs(to_min(t1) - to_min(t2))
     except Exception:
         return 9999
+
+
+def time_diff_signed(t1, t2):
+    """返回 t1 - t2 的分钟数；解析失败返回 None"""
+    def to_min(t):
+        h, m = t.split(":")
+        return int(h) * 60 + int(m)
+    try:
+        return to_min(t1) - to_min(t2)
+    except Exception:
+        return None
+
+
+def hhmm_to_minutes(t):
+    h, m = t.split(":")
+    return int(h) * 60 + int(m)
+
+
+def flight_duration_minutes(dep_t, arr_t):
+    """按 HH:MM 计算时长；若到达早于起飞，视为跨天 +1440。失败返回 None"""
+    try:
+        d = hhmm_to_minutes(dep_t)
+        a = hhmm_to_minutes(arr_t)
+    except Exception:
+        return None
+    if a < d:
+        a += 1440
+    return a - d
+
+
+def fmt_duration(mins):
+    """分钟数格式化为 H:MM"""
+    if mins is None:
+        return ""
+    sign = "-" if mins < 0 else ""
+    m = abs(mins)
+    return f"{sign}{m // 60}:{m % 60:02d}"
 
 
 @st.cache_data
@@ -439,7 +484,7 @@ def find_text_match(approval, text_flights, city_to_icao):
 
 
 # =========================================================
-# docx 标红 / 追加
+# docx 标红/标绿/追加
 # =========================================================
 W_R = qn('w:r')
 W_RPR = qn('w:rPr')
@@ -447,18 +492,18 @@ W_COLOR = qn('w:color')
 W_T = qn('w:t')
 
 
-def _set_run_red(run_element):
+def _set_run_color(run_element, color_hex):
     rPr = run_element.find(W_RPR)
     if rPr is None:
         rPr = run_element.makeelement(W_RPR, {})
         run_element.insert(0, rPr)
     for c in rPr.findall(W_COLOR):
         rPr.remove(c)
-    color = rPr.makeelement(W_COLOR, {qn('w:val'): 'FF0000'})
+    color = rPr.makeelement(W_COLOR, {qn('w:val'): color_hex})
     rPr.append(color)
 
 
-def _make_run_like(src_run_elem, text, red):
+def _make_run_like(src_run_elem, text, color_hex=None):
     new_r = copy.deepcopy(src_run_elem)
     for t in new_r.findall(W_T):
         new_r.remove(t)
@@ -466,50 +511,41 @@ def _make_run_like(src_run_elem, text, red):
     t.text = text
     t.set(qn('xml:space'), 'preserve')
     new_r.append(t)
-    if red:
-        _set_run_red(new_r)
+    if color_hex:
+        _set_run_color(new_r, color_hex)
     return new_r
 
 
-def set_paragraph_runs(paragraph, text, red_parts):
-    if not red_parts:
+def set_paragraph_runs(paragraph, text, color_overrides):
+    """
+    color_overrides: [(color_hex, [parts]), ...]
+    后面的颜色覆盖前面的。
+    """
+    if not color_overrides:
         return
     runs = list(paragraph.runs)
     if not runs:
         return
-
     full_text = "".join(r.text for r in runs)
     if not full_text:
         return
 
-    ranges = []
-    for part in red_parts:
-        if not part:
-            continue
-        start = 0
-        while True:
-            idx = full_text.find(part, start)
-            if idx == -1:
-                break
-            ranges.append((idx, idx + len(part)))
-            start = idx + len(part)
+    char_color = [None] * len(full_text)
+    for color_hex, parts in color_overrides:
+        for part in parts:
+            if not part:
+                continue
+            start = 0
+            while True:
+                idx = full_text.find(part, start)
+                if idx == -1:
+                    break
+                for i in range(idx, idx + len(part)):
+                    char_color[i] = color_hex
+                start = idx + len(part)
 
-    if not ranges:
+    if not any(c is not None for c in char_color):
         return
-
-    ranges.sort()
-    merged = []
-    for a, b in ranges:
-        if merged and a <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
-        else:
-            merged.append((a, b))
-
-    def is_red(pos):
-        for a, b in merged:
-            if a <= pos < b:
-                return True
-        return False
 
     pos = 0
     for run in runs:
@@ -518,14 +554,15 @@ def set_paragraph_runs(paragraph, text, red_parts):
             continue
         r_start = pos
         r_len = len(r_text)
-        red_flags = [is_red(r_start + i) for i in range(r_len)]
+        run_colors = [char_color[r_start + i] for i in range(r_len)]
 
-        if not any(red_flags):
-            pos += r_len
-            continue
-
-        if all(red_flags):
-            _set_run_red(run._element)
+        unique_colors = set(run_colors)
+        if len(unique_colors) == 1:
+            color = run_colors[0]
+            if color is None:
+                pos += r_len
+                continue
+            _set_run_color(run._element, color)
             pos += r_len
             continue
 
@@ -536,16 +573,16 @@ def set_paragraph_runs(paragraph, text, red_parts):
         pieces = []
         i = 0
         while i < r_len:
-            red_now = red_flags[i]
+            c = run_colors[i]
             j = i + 1
-            while j < r_len and red_flags[j] == red_now:
+            while j < r_len and run_colors[j] == c:
                 j += 1
-            pieces.append((r_text[i:j], red_now))
+            pieces.append((r_text[i:j], c))
             i = j
 
         parent.remove(run_elem)
-        for k, (seg, red) in enumerate(pieces):
-            new_r = _make_run_like(run_elem, seg, red)
+        for k, (seg, color) in enumerate(pieces):
+            new_r = _make_run_like(run_elem, seg, color)
             parent.insert(idx_in_parent + k, new_r)
 
         pos += r_len
@@ -556,12 +593,12 @@ def append_red_text(paragraph, text):
     p_elem = paragraph._element
     if runs:
         src = runs[-1]._element
-        new_r = _make_run_like(src, text, red=True)
+        new_r = _make_run_like(src, text, color_hex=RED)
     else:
         new_r = p_elem.makeelement(W_R, {})
         rPr = new_r.makeelement(W_RPR, {})
         new_r.insert(0, rPr)
-        color = rPr.makeelement(W_COLOR, {qn('w:val'): 'FF0000'})
+        color = rPr.makeelement(W_COLOR, {qn('w:val'): RED})
         rPr.append(color)
         t = new_r.makeelement(W_T, {})
         t.text = text
@@ -622,7 +659,7 @@ def _make_red_paragraph_element(text, template_p):
     for c in rPr.findall(W_COLOR):
         rPr.remove(c)
     color = OxmlElement('w:color')
-    color.set(qn('w:val'), 'FF0000')
+    color.set(qn('w:val'), RED)
     rPr.append(color)
 
     r_elem.append(rPr)
@@ -730,6 +767,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
 
     result_rows = []
     approval_red_map = {}
+    approval_green_map = {}
     cancel_paragraphs = []
     approved_index = {}
 
@@ -748,6 +786,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         ).add(approval["dep_dt_bj"].date())
 
         red_parts = []
+        green_parts = []
         diffs = []
         cancel_note = ""
 
@@ -802,28 +841,56 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                 red_parts.append(approval["type"])
 
         if excel_row:
-            dep_same = (approval_dep_time == excel_row["dep_time"])
-            if not dep_same:
-                diffs.append(
-                    f"起飞时间：批复 {approval_dep_time} vs 计划 {excel_row['dep_time']}"
-                )
-                red_parts.append(approval["dep_time_raw"])
+            # ===== 飞行时长核对（核心）=====
+            ap_dur = flight_duration_minutes(approval_dep_time, approval_arr_time)
+            xl_dur = flight_duration_minutes(excel_row["dep_time"], excel_row["arr_time"])
 
-            arr_same = (approval_arr_time == excel_row["arr_time"])
-            if not arr_same:
-                arr_gap = time_diff_minutes(approval_arr_time, excel_row["arr_time"])
-                if not (dep_same and arr_gap <= 30):
+            dur_diff = None
+            if ap_dur is not None and xl_dur is not None:
+                dur_diff = ap_dur - xl_dur
+                if abs(dur_diff) > 30:
                     diffs.append(
-                        f"落地时间：批复 {approval_arr_time} vs 计划 {excel_row['arr_time']}"
+                        f"飞行时长：批复 {fmt_duration(ap_dur)} vs 计划 {fmt_duration(xl_dur)}"
+                        f"（差 {dur_diff:+d} 分钟）"
                     )
                     red_parts.append(approval["arr_time_raw"])
 
+            # ===== 起飞时间偏移提示 =====
+            dep_exact = (approval_dep_time == excel_row["dep_time"])
+            if not dep_exact:
+                dep_diff = time_diff_signed(approval_dep_time, excel_row["dep_time"])
+                if dep_diff is not None and -120 <= dep_diff < 0:
+                    # 早 ≤ 2h，标绿提示
+                    green_parts.append(approval["dep_time_raw"])
+                else:
+                    # 其他情况：只有飞行时长已经报差异时不重复报
+                    if dur_diff is None or abs(dur_diff) <= 30:
+                        diffs.append(
+                            f"起飞时间：批复 {approval_dep_time} vs 计划 {excel_row['dep_time']}"
+                        )
+                        red_parts.append(approval["dep_time_raw"])
+
+            # ===== 落地时间偏移提示 =====
+            arr_exact = (approval_arr_time == excel_row["arr_time"])
+            if not arr_exact:
+                arr_diff = time_diff_signed(approval_arr_time, excel_row["arr_time"])
+                if arr_diff is not None and -120 <= arr_diff < 0:
+                    green_parts.append(approval["arr_time_raw"])
+                else:
+                    if dur_diff is None or abs(dur_diff) <= 30:
+                        diffs.append(
+                            f"落地时间：批复 {approval_arr_time} vs 计划 {excel_row['arr_time']}"
+                        )
+                        red_parts.append(approval["arr_time_raw"])
+
+            # 日期
             if excel_row["dep_date"] and approval["dep_dt_bj"].date() != excel_row["dep_date"]:
                 diffs.append(
                     f"起飞日期：批复 {approval['dep_dt_bj'].date()} vs 计划 {excel_row['dep_date']}"
                 )
                 red_parts.append(approval["date_raw"])
 
+            # 用途
             excel_ferry = is_ferry_use(excel_row["use"])
             expected_service = "N/M" if excel_ferry else "U/H"
 
@@ -834,7 +901,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                 )
                 red_parts.append(approval["service"])
 
-            # ---- 文本 F 标记核对（漏 F / 多 F）----
+            # 文本 F 标记
             if text_flight is not None:
                 text_ferry = text_flight.get("is_ferry", False)
                 if excel_ferry and not text_ferry:
@@ -850,6 +917,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                     if approval["service"] not in red_parts:
                         red_parts.append(approval["service"])
 
+        # 国籍
         if approval["is_domestic"]:
             if text_flight:
                 all_cn = crew_all_chinese(text_flight["crew"], pilots)
@@ -897,14 +965,21 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
             "备注": cancel_note,
         })
 
-        if diffs:
+        if red_parts:
             approval_red_map[raw_text] = red_parts
+        if green_parts:
+            approval_green_map[raw_text] = green_parts
 
-    # 标红
+    # 应用颜色（先绿后红，红覆盖绿）
     for p in iter_doc_paragraphs(doc):
         raw_text = p.text.strip()
-        if raw_text in approval_red_map:
-            set_paragraph_runs(p, raw_text, approval_red_map[raw_text])
+        red = approval_red_map.get(raw_text, [])
+        green = approval_green_map.get(raw_text, [])
+        if red or green:
+            set_paragraph_runs(
+                p, raw_text,
+                [(GREEN, green), (RED, red)]
+            )
 
     # 追加"待取消"
     for p in iter_doc_paragraphs(doc):
@@ -1059,7 +1134,9 @@ with st.sidebar:
         "- 飞行员名单、机型对照表已内置\n"
         "- **用途规则**：Excel 为 `调机` / `维修` → `N/M`；其余 → `U/H`\n"
         "- **用途三方交叉校验**：批复 vs Excel vs 文本 F，漏 F / 多 F 均提示\n"
-        "- **落地时间容差**：起飞时间一致时，落地时间差 ≤ 30 分钟视为一致\n"
+        "- **飞行时长（核心）**：批复 vs Excel，差 ≤ 30 分钟 → OK；差 > 30 分钟 → 报差异，标红落地时间\n"
+        "- **起飞时间**：早于 Excel 且 ≤ 2 小时 → 视为正常，**标绿提示**\n"
+        "- **落地时间**：早于 Excel 且 ≤ 2 小时 → 视为正常，**标绿提示**\n"
         "- **待取消**：批复的起降机场组合在 Excel 找不到 → 段落末尾追加红色“待取消”\n"
         "- **待申请**：Excel 有、批复无该航段日期（含 Z 机场）→ 按日期插入到该飞机批复中\n"
         "- **国籍核对**：批复与文本机组国籍不符 → 标红批复里的标签\n"
