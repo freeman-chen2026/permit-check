@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 国内批复核对工具 - Streamlit 版本
-上传：批复汇总表 docx、航段数据导出 xlsx、文本版航班信息 txt、飞行员名单 txt
-输出：差异列表 + 标红后的 docx 下载
+- 飞行员名单内置
+- 航班信息支持文本框粘贴
+- 内置机型对照表
 """
 
 import io
@@ -16,7 +17,7 @@ from docx.shared import RGBColor
 from openpyxl import load_workbook
 
 # =========================================================
-# 基础常量
+# 常量
 # =========================================================
 MONTHS = {
     "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4,
@@ -24,22 +25,100 @@ MONTHS = {
     "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
 }
 
-st.set_page_config(
-    page_title="国内批复核对工具",
-    page_icon="✈️",
-    layout="wide",
-)
+# 内置飞行员名单
+PILOT_RAW = """P001,庚凡,gengfan@amber-aviation.com
+P002,张永一,zhangyongyi@amber-aviation.com
+P003,梅峰,fmei@amber-aviation.com
+P004,王斌,wangbin@amber-aviation.com
+P019,"HEALY, Darran William",darranhealy@amber-aviation.com
+P020,"BEEBE, Thaddeus John",thaddeusbeebe@amber-aviation.com
+P032,林毅,ericlin@amber-aviation.com
+P035,"Peter Robert, JACKSON",prjackson@amber-aviation.com
+P036,王少雄,warrenwang@amber-aviation.com
+P038,苗旺旺,johnmiao@amber-aviation.com
+P039,"Yiftah, RAUCH",yiftahrauch@amber-aviation.com
+P044,李辛欣,rockli@amber-aviation.com
+P046,赵岩松,zhyszhao@amber-aviation.com
+P051,彭罡,eugene.peng@humbleholding.com
+P052,胡君量,brian.wu@humbleholding.com
+P053,"Bruce Roderick, WAINES",brwaines@amber-aviation.com
+P054,"Rodolfo, BONETTI",rbonetti@amber-aviation.com
+P056,"Keith Robert, SHERREN",krsherren@amber-aviation.com
+P057,"Oliver Viktor, RACZ",ovracz@amber-aviation.com
+P059,蔡国俊,kctsai@amber-aviation.com
+P061,李庆宏,qhli@amber-aviation.com
+P065,宋炜,wsong@amber-aviation.com
+P068,昝昭君,zjzan@amber-aviation.com
+P069,"ROEDER, SIMONE ELKE",simoneroeder@amber-aviation.com
+P070,"Herve Daniel, STAMM",hdstamm@amber-aviation.com
+P071,孙浩,jasonsun@amber-aviation.com
+P072,朱正宇,zyzhu@amber-aviation.com
+P074,金尚明,smjin@amber-aviation.com
+P075,"Eduard Pascal, Roski",eduardroski@amber-aviation.com
+P077,刘凯,andyliu@amber-aviation.com
+P078,张帆,fzhang@amber-aviation.com
+P079,魏思远,wesleywei@amber-aviation.com
+P080,刘爽,sliu@amber-aviation.com
+P081,吴鹏,richardwu@amber-aviation.com
+P082,刘汇川,frankliu@amber-aviation.com
+P083,尤欣,xyou@amber-aviation.com
+P084,李亚民,ymli@amber-aviation.com
+P085,赵镭,lzhao@amber-aviation.com
+P086,张贺新,hxzhang@amber-aviation.com
+P087,孙赫,hesun@amber-aviation.com
+P088,马坚,harryma@amber-aviation.com
+P089,李晓龙,xlli@amber-aviation.com
+P090,黄海东,hdhuang@amber-aviation.com
+P091,马洪双,mikema@amber-aviation.com
+PJZ001,张哲,zzhang@amber-aviation.com
+PJZ002,郭春旭,charlesguo@amber-aviation.com
+PJZ004,王国勤,leowang@amber-aviation.com
+PJZ005,王莹,evawang@amber-aviation.com
+PJZ007,徐卓,frankxu@amber-aviation.com
+PJZ008,杨华,ariayang@amber-aviation.com
+W070,王彦海,wang_yanhai@163.com
+W213,沈志伟,cshum@tagaviation.com
+W267,"Nathon Andrew G, NORBERG",naten7@hotmail.com
+W268,"Daniel, RICHTER",pilotlocalizer@gmail.com
+W270,杨涛,yang_tao2005@aliyun.com
+W272,"Andrew Nigel, KING",Andrew.king@aero.bombardier.com
+"""
+
+# 内置机型对照表
+AIRCRAFT_TYPE_MAP = {
+    "B3926": "LJ60",
+    "B652R": "GLF4",
+    "B8105": "GLEX",
+    "B8160": "GLF5",
+    "B8262": "GLF4",
+    "B8292": "GLF5",
+    "B8309": "GLF5",
+    "MLLIN": "GLEX",
+    "N2QE": "GL5T",
+    "N328LM": "GL7T",
+    "N550DR": "GLF5",
+    "N577QT": "F900",
+    "N7777U": "GLEX",
+    "N777ZH": "GLF5",
+    "N88AY": "GLF5",
+    "T7178HT": "GL7T",
+    "T7CJK": "GLEX",
+    "VPCSZ": "GL7T",
+    "VPCVA": "GLF6",
+    "B652Q": "GLF4",
+    "B652S": "GLF4",
+    "B65AP": "GLF4",
+}
+
+st.set_page_config(page_title="国内批复核对工具", page_icon="✈️", layout="wide")
 
 
 # =========================================================
-# 工具函数
+# 工具
 # =========================================================
 def parse_date_token(token):
     token = token.strip().upper()
-    day = int(token[:2])
-    mon = MONTHS[token[2:5]]
-    year = int(token[5:])
-    return datetime.date(year, mon, day)
+    return datetime.date(int(token[5:]), MONTHS[token[2:5]], int(token[:2]))
 
 
 def parse_hhmm(token):
@@ -52,10 +131,6 @@ def is_b_reg(reg):
 
 
 def to_beijing_datetime(reg, date_obj, hhmm_token):
-    """
-    B 注册：按北京时间直接使用；
-    非 B 注册：按世界时 UTC，+8 小时转为北京时间。
-    """
     dt = datetime.datetime.combine(date_obj, parse_hhmm(hhmm_token))
     if not is_b_reg(reg):
         dt += datetime.timedelta(hours=8)
@@ -71,9 +146,7 @@ def fmt_time(value):
         return value.strftime("%H:%M")
     s = str(value).strip()
     m = re.match(r"(\d{1,2}):(\d{2})", s)
-    if m:
-        return f"{int(m.group(1)):02d}:{m.group(2)}"
-    return s
+    return f"{int(m.group(1)):02d}:{m.group(2)}" if m else s
 
 
 def fmt_date(value):
@@ -106,13 +179,10 @@ def time_diff_minutes(t1, t2):
         return 9999
 
 
-# =========================================================
-# 读取飞行员名单
-# =========================================================
-def load_pilots_from_bytes(data: bytes):
-    text = data.decode("utf-8-sig", errors="ignore")
+@st.cache_data
+def load_pilots():
     pilots = {}
-    for line in text.splitlines():
+    for line in PILOT_RAW.strip().splitlines():
         line = line.strip()
         if not line:
             continue
@@ -126,8 +196,7 @@ def load_pilots_from_bytes(data: bytes):
 
 
 def crew_all_chinese(crew_codes, pilots):
-    pilot_codes = [c.strip() for c in crew_codes
-                   if c.strip().startswith(("P", "W"))]
+    pilot_codes = [c.strip() for c in crew_codes if c.strip().startswith(("P", "W"))]
     if not pilot_codes:
         return None
     for code in pilot_codes:
@@ -139,10 +208,10 @@ def crew_all_chinese(crew_codes, pilots):
 
 
 # =========================================================
-# 解析批复行
+# 解析批复
 # =========================================================
 APPROVAL_RE = re.compile(
-    r"^(?P<reg>[A-Z0-9]+)\s+"
+    r"^(?P<reg>[A-Z0-9\-]+)\s+"
     r"(?P<type>[A-Z0-9]+)\s+"
     r"(?P<dep>[A-Z]{4})(?P<dep_time>\d{4})\s+"
     r"(?P<arr_time>\d{4})(?P<arr>[A-Z]{4})\s+"
@@ -157,11 +226,11 @@ def parse_approval_line(text):
     if not m:
         return None
 
-    reg = m.group("reg").upper()
+    reg = m.group("reg").upper().replace("-", "")
     dep = m.group("dep").upper()
     arr = m.group("arr").upper()
-    dep_time_raw = m.group("dep_time")
-    arr_time_raw = m.group("arr_time")
+    dep_raw = m.group("dep_time")
+    arr_raw = m.group("arr_time")
     date_raw = m.group("date").upper()
     rest = m.group("rest").strip()
 
@@ -181,12 +250,12 @@ def parse_approval_line(text):
         "reg": reg,
         "type": m.group("type").upper(),
         "dep": dep,
-        "dep_time_raw": dep_time_raw,
-        "arr_time_raw": arr_time_raw,
+        "dep_time_raw": dep_raw,
+        "arr_time_raw": arr_raw,
         "arr": arr,
         "date_raw": date_raw,
-        "dep_dt_bj": to_beijing_datetime(reg, date_obj, dep_time_raw),
-        "arr_dt_bj": to_beijing_datetime(reg, date_obj, arr_time_raw),
+        "dep_dt_bj": to_beijing_datetime(reg, date_obj, dep_raw),
+        "arr_dt_bj": to_beijing_datetime(reg, date_obj, arr_raw),
         "service": service,
         "remark": remark,
     }
@@ -235,45 +304,37 @@ def load_excel_rows_from_bytes(data: bytes):
 
 
 # =========================================================
-# 解析文本版航班信息
+# 解析文本航班信息
 # =========================================================
 FLIGHT_HEADER_RE = re.compile(
     r"^([A-Z0-9]+)\s+(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})(?:\s*\+1)?$"
 )
 
 
-def load_text_flights_from_bytes(data: bytes):
-    text = data.decode("utf-8-sig", errors="ignore")
+def load_text_flights(text: str):
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-
     flights = []
     i = 0
     while i < len(lines):
         m = FLIGHT_HEADER_RE.match(lines[i])
         if m:
             reg = m.group(1).upper()
-            dep_time = m.group(2)
-            arr_time = m.group(3)
-
+            dep_time, arr_time = m.group(2), m.group(3)
             if i + 1 < len(lines):
                 cm = re.match(r"^(.+?)\s+-\s+(.+)$", lines[i + 1])
                 if cm:
-                    dep_city = cm.group(1).strip()
-                    arr_city = cm.group(2).strip()
                     crew = []
                     if i + 2 < len(lines):
                         cl = lines[i + 2].replace(" ", "")
                         if re.match(r"^[A-Z0-9,]+$", cl):
                             crew = [x for x in cl.split(",") if x]
-
                     flights.append({
                         "reg": reg,
                         "dep_time": dep_time,
                         "arr_time": arr_time,
-                        "dep_city": dep_city,
-                        "arr_city": arr_city,
+                        "dep_city": cm.group(1).strip(),
+                        "arr_city": cm.group(2).strip(),
                         "crew": crew,
-                        "raw": f"{lines[i]}\n{lines[i+1]}\n{','.join(crew)}",
                     })
                     i += 3
                     continue
@@ -303,7 +364,6 @@ def find_excel_match(approval, excel_rows):
         candidates = [r for r in excel_rows if r["reg"] == approval["reg"]]
     if not candidates:
         return None
-
     target = approval["dep_dt_bj"].strftime("%H:%M")
     candidates.sort(key=lambda r: time_diff_minutes(r["dep_time"], target))
     return candidates[0]
@@ -321,7 +381,6 @@ def find_text_match(approval, text_flights, city_to_icao):
         candidates = [tf for tf in text_flights if tf["reg"] == approval["reg"]]
     if not candidates:
         return None
-
     target = approval["dep_dt_bj"].strftime("%H:%M")
     candidates.sort(key=lambda x: time_diff_minutes(x["dep_time"], target))
     return candidates[0]
@@ -368,12 +427,11 @@ def set_paragraph_runs(paragraph, text, red_parts):
 
 
 # =========================================================
-# 核对主流程
+# 主核对
 # =========================================================
-def run_check(docx_bytes, excel_bytes, text_bytes, pilot_bytes):
-    pilots = load_pilots_from_bytes(pilot_bytes)
+def run_check(docx_bytes, excel_bytes, text_content, pilots):
     excel_rows = load_excel_rows_from_bytes(excel_bytes)
-    text_flights = load_text_flights_from_bytes(text_bytes)
+    text_flights = load_text_flights(text_content)
 
     city_to_icao = {}
     for row in excel_rows:
@@ -405,7 +463,18 @@ def run_check(docx_bytes, excel_bytes, text_bytes, pilot_bytes):
         approval_dep_time = approval["dep_dt_bj"].strftime("%H:%M")
         approval_arr_time = approval["arr_dt_bj"].strftime("%H:%M")
 
-        # 机场
+        # ---- 机型 ----
+        expected_type = AIRCRAFT_TYPE_MAP.get(approval["reg"])
+        if expected_type is None:
+            diffs.append(f"机型：注册号 {approval['reg']} 不在机型对照表中")
+            red_parts.append(approval["type"])
+        elif approval["type"] != expected_type:
+            diffs.append(
+                f"机型：批复 {approval['type']} vs 对照表 {expected_type}"
+            )
+            red_parts.append(approval["type"])
+
+        # ---- Excel 相关 ----
         if excel_row:
             if approval["dep"] != excel_row["dep"]:
                 diffs.append(f"起飞机场：批复 {approval['dep']} vs 计划 {excel_row['dep']}")
@@ -413,8 +482,6 @@ def run_check(docx_bytes, excel_bytes, text_bytes, pilot_bytes):
             if approval["arr"] != excel_row["arr"]:
                 diffs.append(f"到达机场：批复 {approval['arr']} vs 计划 {excel_row['arr']}")
                 red_parts.append(approval["arr"])
-
-            # 时间
             if approval_dep_time != excel_row["dep_time"]:
                 diffs.append(
                     f"起飞时间：批复 {approval_dep_time} vs 计划 {excel_row['dep_time']}"
@@ -425,15 +492,12 @@ def run_check(docx_bytes, excel_bytes, text_bytes, pilot_bytes):
                     f"落地时间：批复 {approval_arr_time} vs 计划 {excel_row['arr_time']}"
                 )
                 red_parts.append(approval["arr_time_raw"])
-
-            # 日期
             if excel_row["dep_date"] and approval["dep_dt_bj"].date() != excel_row["dep_date"]:
                 diffs.append(
                     f"起飞日期：批复 {approval['dep_dt_bj'].date()} vs 计划 {excel_row['dep_date']}"
                 )
                 red_parts.append(approval["date_raw"])
 
-            # 用途
             expected_use = ""
             if approval["service"] == "U/H":
                 expected_use = "载客"
@@ -447,7 +511,7 @@ def run_check(docx_bytes, excel_bytes, text_bytes, pilot_bytes):
         else:
             diffs.append("未在 Excel 中找到匹配航段")
 
-        # 中国籍备注
+        # ---- 中国籍 ----
         if text_flight:
             all_cn = crew_all_chinese(text_flight["crew"], pilots)
             if all_cn is None:
@@ -466,6 +530,7 @@ def run_check(docx_bytes, excel_bytes, text_bytes, pilot_bytes):
         result_rows.append({
             "批复": raw_text,
             "飞机号": approval["reg"],
+            "机型": approval["type"],
             "批复起飞(北京时)": approval_dep_time,
             "批复落地(北京时)": approval_arr_time,
             "批复日期": approval["dep_dt_bj"].date().isoformat(),
@@ -480,7 +545,6 @@ def run_check(docx_bytes, excel_bytes, text_bytes, pilot_bytes):
         if diffs:
             approval_red_map[raw_text] = red_parts
 
-    # docx 标红
     for p in iter_doc_paragraphs(doc):
         raw_text = p.text.strip()
         if raw_text in approval_red_map:
@@ -489,58 +553,79 @@ def run_check(docx_bytes, excel_bytes, text_bytes, pilot_bytes):
     out_buf = io.BytesIO()
     doc.save(out_buf)
     out_buf.seek(0)
-
     return result_rows, out_buf
 
 
 # =========================================================
-# Streamlit UI
+# UI
 # =========================================================
 st.title("✈️ 国内批复核对工具")
-st.caption("上传以下四个文件，自动识别批复、比对差异、标红并下载 docx。")
+st.caption("上传批复汇总表 + 航段数据，粘贴文本航班信息，即可自动核对差异。")
 
 with st.sidebar:
     st.header("📁 上传文件")
     docx_file = st.file_uploader("① 国内批复信息汇总表 (.docx)", type=["docx"])
     excel_file = st.file_uploader("② 航段数据导出 (.xlsx)", type=["xlsx"])
-    text_file = st.file_uploader("③ 文本版航班信息 (.txt)", type=["txt"])
-    pilot_file = st.file_uploader("④ 飞行员名单 (.txt)", type=["txt"])
 
     st.markdown("---")
     st.markdown(
-        "**说明**\n\n"
-        "- B 注册号：批复时间按北京时间\n"
-        "- 其他注册号（N、T7、M…）：批复时间按世界时 UTC，+8 转为北京时间\n"
-        "- `U/H` 视为载客，`N/M` 视为调机\n"
-        "- 备注含“中国籍”则期望机组全为中国籍"
+        "**说明**\n"
+        "- 飞行员名单已内置，无需上传\n"
+        "- 机型对照表已内置\n"
+        "- B 注册号批复时间按北京时间\n"
+        "- 其他注册号（N、T7、M…）按世界时 UTC，+8 转北京时间\n"
+        "- `U/H` → 载客，`N/M` → 调机\n"
+        "- 批复备注含“中国籍”则期望机组全为中国籍"
     )
 
-if not (docx_file and excel_file and text_file and pilot_file):
-    st.info("👈 请先在左侧上传四个文件。")
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    text_input = st.text_area(
+        "③ 粘贴文本版航班信息",
+        height=320,
+        placeholder="例如：\nB8160 13:00 - 20:45\n马尔代夫马法鲁岛 - 北京大兴\nP083,PJZ005,C054,M041",
+    )
+
+with col2:
+    text_file = st.file_uploader(
+        "或上传 .txt（可选，粘贴优先）", type=["txt"], key="textfile"
+    )
+    st.caption("若同时提供，使用上方粘贴内容。")
+
+# 决定使用哪个文本
+if text_input.strip():
+    text_content = text_input
+elif text_file is not None:
+    text_content = text_file.getvalue().decode("utf-8-sig", errors="ignore")
+else:
+    text_content = ""
+
+if not docx_file or not excel_file or not text_content:
+    st.info("👈 请上传批复汇总表、航段数据，并提供文本版航班信息。")
     st.stop()
 
 if st.button("🚀 开始核对", type="primary"):
-    with st.spinner("正在核对，请稍候..."):
+    with st.spinner("正在核对..."):
         try:
             rows, out_buf = run_check(
                 docx_file.getvalue(),
                 excel_file.getvalue(),
-                text_file.getvalue(),
-                pilot_file.getvalue(),
+                text_content,
+                load_pilots(),
             )
         except Exception as e:
-            st.error(f"核对出错：{e}")
+            st.exception(e)
             st.stop()
 
     df = pd.DataFrame(rows)
-
-    # 汇总
     total = len(df)
     diff_count = (df["是否一致"] == "否").sum() if total else 0
+
     c1, c2, c3 = st.columns(3)
     c1.metric("批复条数", total)
     c2.metric("一致", total - diff_count)
-    c3.metric("有差异", diff_count, delta=None if diff_count == 0 else -diff_count)
+    c3.metric("有差异", diff_count)
 
     st.subheader("📋 核对结果")
     if total == 0:
@@ -564,7 +649,8 @@ if st.button("🚀 开始核对", type="primary"):
         else:
             for _, r in diffs_df.iterrows():
                 st.markdown(f"**`{r['批复']}`**")
-                st.markdown(f"- {r['差异'].replace('；', chr(10) + '- ')}")
+                for line in r["差异"].split("；"):
+                    st.markdown(f"- {line}")
 
     st.subheader("📥 下载标红后的批复汇总表")
     st.download_button(
