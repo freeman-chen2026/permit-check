@@ -5,6 +5,7 @@
 - 航班信息文本框粘贴
 - 内置机型对照表
 - 标红时保留原字体
+- 支持内机 / 外机不同批复格式
 """
 
 import io
@@ -15,7 +16,6 @@ import datetime
 import pandas as pd
 import streamlit as st
 from docx import Document
-from docx.shared import RGBColor
 from docx.oxml.ns import qn
 from openpyxl import load_workbook
 
@@ -118,8 +118,16 @@ st.set_page_config(page_title="国内批复核对工具", page_icon="✈️", la
 # 工具
 # =========================================================
 def parse_date_token(token):
+    """支持 01OCT2026 和 01OCT26 两种年份"""
     token = token.strip().upper()
-    return datetime.date(int(token[5:]), MONTHS[token[2:5]], int(token[:2]))
+    day = int(token[:2])
+    mon = MONTHS[token[2:5]]
+    year_str = token[5:]
+    if len(year_str) == 2:
+        year = 2000 + int(year_str)
+    else:
+        year = int(year_str)
+    return datetime.date(year, mon, day)
 
 
 def parse_hhmm(token):
@@ -209,14 +217,14 @@ def crew_all_chinese(crew_codes, pilots):
 
 
 # =========================================================
-# 解析批复
+# 解析批复（支持内机 / 外机两种格式）
 # =========================================================
 APPROVAL_RE = re.compile(
     r"^(?P<reg>[A-Z0-9\-]+)\s+"
-    r"(?P<type>[A-Z0-9]+)\s+"
+    r"(?P<second>[A-Z0-9]+)\s+"          # B 注册是机型；外机是航班号
     r"(?P<dep>[A-Z]{4})(?P<dep_time>\d{4})\s+"
     r"(?P<arr_time>\d{4})(?P<arr>[A-Z]{4})\s+"
-    r"ON\s+(?P<date>\d{2}[A-Z]{3}\d{4})\s+"
+    r"ON\s+(?P<date>\d{2}[A-Z]{3}\d{2,4})\s+"   # 支持 2 位 / 4 位年份
     r"(?P<rest>.+)$",
     re.IGNORECASE,
 )
@@ -228,12 +236,21 @@ def parse_approval_line(text):
         return None
 
     reg = m.group("reg").upper().replace("-", "")
+    second = m.group("second").upper()
     dep = m.group("dep").upper()
     arr = m.group("arr").upper()
     dep_raw = m.group("dep_time")
     arr_raw = m.group("arr_time")
     date_raw = m.group("date").upper()
     rest = m.group("rest").strip()
+
+    # B 注册：第二字段是机型；外机：第二字段是航班号
+    if is_b_reg(reg):
+        ac_type = second
+        flight_no = ""
+    else:
+        ac_type = ""
+        flight_no = second
 
     service, remark = "", ""
     sm = re.match(r"^(U/H|N/M)(.*)$", rest, re.IGNORECASE)
@@ -249,7 +266,9 @@ def parse_approval_line(text):
     return {
         "raw": text.strip(),
         "reg": reg,
-        "type": m.group("type").upper(),
+        "type": ac_type,
+        "flight_no": flight_no,
+        "is_domestic": is_b_reg(reg),
         "dep": dep,
         "dep_time_raw": dep_raw,
         "arr_time_raw": arr_raw,
@@ -408,14 +427,8 @@ def _set_run_red(run_element):
 
 
 def set_paragraph_runs(paragraph, text, red_parts):
-    """
-    在段落内标红指定文本，保留原字体格式：
-    按红/非红把段落切成片段，每个片段复制其源 run 的 XML（含字体），
-    仅对红色片段追加 w:color=FF0000。
-    """
     if not red_parts:
         return
-
     runs = list(paragraph.runs)
     if not runs:
         return
@@ -425,7 +438,6 @@ def set_paragraph_runs(paragraph, text, red_parts):
         return
     text = full_text
 
-    # 计算红色区间
     ranges = []
     for part in red_parts:
         if not part:
@@ -455,12 +467,10 @@ def set_paragraph_runs(paragraph, text, red_parts):
                 return True
         return False
 
-    # 每个字符对应的源 run
     char_run = []
     for r in runs:
         char_run.extend([r] * len(r.text))
 
-    # 按红/非红切成连续片段
     segments = []
     i = 0
     while i < len(text):
@@ -471,28 +481,20 @@ def set_paragraph_runs(paragraph, text, red_parts):
         segments.append((text[i:j], red_now, char_run[i]))
         i = j
 
-    # 移除段落中现有 run
     p_elem = paragraph._element
     for r_elem in p_elem.findall(W_R):
         p_elem.remove(r_elem)
 
-    # 按片段重建 run，复制源 run 的格式
     for seg_text, red, src_run in segments:
         new_r = copy.deepcopy(src_run._element)
-
-        # 清空原有 w:t
         for t in new_r.findall(W_T):
             new_r.remove(t)
-
-        # 写入新文本
         t_elem = new_r.makeelement(W_T, {})
         t_elem.text = seg_text
         t_elem.set(qn('xml:space'), 'preserve')
         new_r.append(t_elem)
-
         if red:
             _set_run_red(new_r)
-
         p_elem.append(new_r)
 
 
@@ -533,16 +535,17 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         approval_dep_time = approval["dep_dt_bj"].strftime("%H:%M")
         approval_arr_time = approval["arr_dt_bj"].strftime("%H:%M")
 
-        # 机型
-        expected_type = AIRCRAFT_TYPE_MAP.get(approval["reg"])
-        if expected_type is None:
-            diffs.append(f"机型：注册号 {approval['reg']} 不在机型对照表中")
-            red_parts.append(approval["type"])
-        elif approval["type"] != expected_type:
-            diffs.append(f"机型：批复 {approval['type']} vs 对照表 {expected_type}")
-            red_parts.append(approval["type"])
+        # ---- 机型：仅对 B 注册核对 ----
+        if approval["is_domestic"]:
+            expected_type = AIRCRAFT_TYPE_MAP.get(approval["reg"])
+            if expected_type is None:
+                diffs.append(f"机型：注册号 {approval['reg']} 不在机型对照表中")
+                red_parts.append(approval["type"])
+            elif approval["type"] != expected_type:
+                diffs.append(f"机型：批复 {approval['type']} vs 对照表 {expected_type}")
+                red_parts.append(approval["type"])
 
-        # Excel
+        # ---- Excel ----
         if excel_row:
             if approval["dep"] != excel_row["dep"]:
                 diffs.append(f"起飞机场：批复 {approval['dep']} vs 计划 {excel_row['dep']}")
@@ -579,26 +582,30 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         else:
             diffs.append("未在 Excel 中找到匹配航段")
 
-        # 中国籍
-        if text_flight:
-            all_cn = crew_all_chinese(text_flight["crew"], pilots)
-            if all_cn is None:
-                diffs.append("中国籍备注：机组名单不全，未核对")
+        # ---- 中国籍：仅对 B 注册核对 ----
+        if approval["is_domestic"]:
+            if text_flight:
+                all_cn = crew_all_chinese(text_flight["crew"], pilots)
+                if all_cn is None:
+                    diffs.append("中国籍备注：机组名单不全，未核对")
+                else:
+                    actual_cn = "中国籍" in approval["remark"]
+                    if all_cn and not actual_cn:
+                        diffs.append("中国籍备注：机组全为中国籍，但批复未写“中国籍”")
+                        red_parts.append(approval["remark"])
+                    elif not all_cn and actual_cn:
+                        diffs.append("中国籍备注：机组含外籍飞行员，但批复写“中国籍”")
+                        red_parts.append("中国籍")
             else:
-                actual_cn = "中国籍" in approval["remark"]
-                if all_cn and not actual_cn:
-                    diffs.append("中国籍备注：机组全为中国籍，但批复未写“中国籍”")
-                    red_parts.append(approval["remark"])
-                elif not all_cn and actual_cn:
-                    diffs.append("中国籍备注：机组含外籍飞行员，但批复写“中国籍”")
-                    red_parts.append("中国籍")
-        else:
-            diffs.append("未找到对应文本版航班信息，无法核验机组")
+                diffs.append("未找到对应文本版航班信息，无法核验机组")
 
         result_rows.append({
             "批复": raw_text,
             "飞机号": approval["reg"],
-            "机型": approval["type"],
+            "航班号": approval["flight_no"] if not approval["is_domestic"] else "",
+            "机型": approval["type"] if approval["is_domestic"]
+                    else AIRCRAFT_TYPE_MAP.get(approval["reg"], ""),
+            "内/外机": "内机" if approval["is_domestic"] else "外机",
             "批复起飞(北京时)": approval_dep_time,
             "批复落地(北京时)": approval_arr_time,
             "批复日期": approval["dep_dt_bj"].date().isoformat(),
@@ -613,7 +620,6 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         if diffs:
             approval_red_map[raw_text] = red_parts
 
-    # 标红
     for p in iter_doc_paragraphs(doc):
         raw_text = p.text.strip()
         if raw_text in approval_red_map:
@@ -641,10 +647,11 @@ with st.sidebar:
         "**说明**\n"
         "- 飞行员名单已内置，无需上传\n"
         "- 机型对照表已内置\n"
-        "- B 注册号批复时间按北京时间\n"
-        "- 其他注册号（N、T7、M…）按世界时 UTC，+8 转北京时间\n"
+        "- **内机**：`注册号 机型 起飞机场+时间 到达时间+到达机场 ON 日期 U/H|N/M`\n"
+        "- **外机**：`注册号 航班号 起飞机场+时间 到达时间+到达机场 ON 日期 U/H|N/M`\n"
+        "- B 注册号批复时间按北京时间；其他按世界时 UTC +8\n"
         "- `U/H` → 载客，`N/M` → 调机\n"
-        "- 批复备注含“中国籍”则期望机组全为中国籍"
+        "- 外机不核对机组中国籍"
     )
 
 text_input = st.text_area(
