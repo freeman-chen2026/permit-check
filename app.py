@@ -8,12 +8,13 @@
   · 跨天宽容：日期差 1 天且真实时差 ≤ 10 小时
   · 日期差 ≥ 2 天 → 不匹配 → 待取消
 - 文本匹配：注册号 + 起降城市 完全一致；一条只能用一次
+  · 文本未提供该航段 → 备注「待确认机组」
 - Excel 有但未被任何批复使用 → 待申请
 - 文本匹配不到 → 输出"机组未定，需确认"
 
 时间判定（用真实时差 real_dep_diff = 批复 - Excel，考虑日期）：
 - real_dep_diff == 0 → OK
-- -600 ≤ real_dep_diff < 0（批复早 ≤ 10h）→ 标绿（无需变更）
+- -600 ≤ real_dep_diff < 0（批复早 ≤ 10h）→ 标绿
 - real_dep_diff > 0（批复晚）→ 待变更
 - real_dep_diff < -600（批复早 > 10h）→ 标红
 
@@ -50,9 +51,8 @@ MONTHS = {
 RED = "FF0000"
 GREEN = "00B050"
 
-# 时间容差（分钟）
-MAX_CROSS_DAY_GAP_MIN = 600       # 跨天匹配：日期差 1 天且时差 ≤ 10 小时
-EARLY_GREEN_THRESHOLD_MIN = 600   # 早于 Excel ≤ 10 小时 → 标绿（无需变更）
+MAX_CROSS_DAY_GAP_MIN = 600
+EARLY_GREEN_THRESHOLD_MIN = 600
 
 PILOT_RAW = """P001,庚凡,gengfan@amber-aviation.com
 P002,张永一,zhangyongyi@amber-aviation.com
@@ -246,7 +246,6 @@ def fmt_duration(mins):
 
 
 def compute_real_minute_diff(ap_date, ap_time_str, xl_date, xl_time_str):
-    """返回 批复时刻 - Excel时刻 的分钟数（考虑日期差）"""
     if ap_date is None or xl_date is None:
         return None
     try:
@@ -455,16 +454,9 @@ def load_text_flights(text: str):
 
 
 # =========================================================
-# 匹配（带唯一性约束 + 日期宽容）
+# 匹配
 # =========================================================
 def find_excel_match(approval, excel_rows, used_excel):
-    """
-    Excel 匹配：注册号 + 起降机场 + 日期
-    优先级 1：日期完全一致（按起飞时间选最接近）
-    优先级 2：日期差 1 天且真实时差 ≤ MAX_CROSS_DAY_GAP_MIN
-    日期差 ≥ 2 天 → 不匹配 → 待取消
-    一条 Excel 行只能用一次
-    """
     base_candidates = [
         r for r in excel_rows
         if r["_idx"] not in used_excel
@@ -478,7 +470,6 @@ def find_excel_match(approval, excel_rows, used_excel):
     approval_date = approval["dep_dt_bj"].date()
     approval_dep_time = approval["dep_dt_bj"].strftime("%H:%M")
 
-    # 优先级 1：同日
     same_date = [r for r in base_candidates if r["dep_date"] == approval_date]
     if same_date:
         same_date.sort(key=lambda r: time_diff_minutes(r["dep_time"], approval_dep_time))
@@ -486,7 +477,6 @@ def find_excel_match(approval, excel_rows, used_excel):
         used_excel.add(matched["_idx"])
         return matched
 
-    # 优先级 2：日期差 1 天且真实时差 ≤ 10 小时
     close_date = []
     for r in base_candidates:
         if r["dep_date"] is None:
@@ -893,7 +883,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                 )
                 red_parts.append(approval["arr_time_raw"])
 
-        # 起飞时间（用真实时差，考虑日期）
+        # 起飞时间
         real_dep_diff = compute_real_minute_diff(
             approval["dep_dt_bj"].date(), approval_dep_time,
             excel_row["dep_date"], excel_row["dep_time"]
@@ -904,11 +894,9 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         elif real_dep_diff == 0:
             dep_ok = True
         elif -EARLY_GREEN_THRESHOLD_MIN <= real_dep_diff < 0:
-            # 批复早 ≤ 10h → 标绿
             dep_ok = True
             green_parts.append(approval["dep_time_raw"])
         elif real_dep_diff > 0:
-            # 批复晚于 Excel → 待变更
             dep_ok = False
             diffs.append(
                 f"起飞时间：批复 {approval_dep_time} 晚于计划 {excel_row['dep_time']}，需重新申请"
@@ -916,7 +904,6 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
             red_parts.append(approval["dep_time_raw"])
             change_paragraphs.add(raw_text)
         else:  # real_dep_diff < -EARLY_GREEN_THRESHOLD_MIN
-            # 批复早 > 10h → 标红
             dep_ok = False
             diffs.append(
                 f"起飞时间：批复 {approval_dep_time} vs 计划 {excel_row['dep_time']}"
@@ -924,7 +911,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
             )
             red_parts.append(approval["dep_time_raw"])
 
-        # 落地时间：早 ≤ 10h（且起飞正常）→ 标绿
+        # 落地时间
         xl_arr_date = excel_row["arr_date"] or excel_row["dep_date"]
         real_arr_diff = compute_real_minute_diff(
             approval["arr_dt_bj"].date(), approval_arr_time,
@@ -983,7 +970,8 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                         elif not has_foreign:
                             diffs.append("国籍未标注（应为外籍）")
             else:
-                diffs.append("文本未提供该航段，无法核验机组")
+                # 文本未提供该航段 → 待确认机组
+                note_parts.append("待确认机组")
 
         if raw_text in change_paragraphs:
             note_parts.append("待变更")
@@ -1182,14 +1170,12 @@ with st.sidebar:
         "- 飞行员名单、机型对照表已内置\n"
         "- **Excel 匹配**：注册号 + 起降机场 + 日期（同日优先；其次差 1 天且真实时差 ≤ 10 小时）\n"
         "- **文本匹配**：注册号 + 起降城市 完全一致（一条只能用一次）\n"
+        "  · 文本未提供该航段 → 备注「待确认机组」\n"
         "- **待取消**：Excel 里找不到匹配（含 ±1 天宽容）→ 追加红色“待取消”\n"
         "- **待申请**：Excel 有但未被任何批复使用（含 Z 机场）→ 按日期插入\n"
         "- **用途规则**：Excel 为 `调机` / `维修` → `N/M`；其余 → `U/H`\n"
         "- **飞行时长**：差 ≤ 30 分钟 → OK；> 30 分钟 → 报差异\n"
-        "- **起飞时间**（考虑日期）：\n"
-        "  · 批复早 ≤ 10h → 标绿（无需变更）\n"
-        "  · **批复晚于 Excel（任何时差）→ 报差异 + 追加“待变更”**\n"
-        "  · 批复早 > 10h → 标红\n"
+        "- **起飞时间**（考虑日期）：早 ≤ 10h → 标绿；晚于 Excel → 报差异 + 待变更；早 > 10h → 标红\n"
         "- **落地时间**（考虑日期）：早 ≤ 10h（且起飞正常）→ 标绿"
     )
 
@@ -1238,7 +1224,7 @@ if st.button("🚀 开始核对", type="primary"):
     else:
         def highlight(row):
             if row["是否一致"] == "否":
-                if "机组未定" in str(row["备注"]):
+                if "待确认机组" in str(row["备注"]):
                     return ["background-color: #fff3cd"] * len(row)
                 if "待变更" in str(row["备注"]):
                     return ["background-color: #e5f0ff"] * len(row)
@@ -1257,7 +1243,7 @@ if st.button("🚀 开始核对", type="primary"):
             st.success("✅ 所有批复与计划一致，未发现差异。")
         else:
             for _, r in diffs_df.iterrows():
-                if "机组未定" in str(r["备注"]):
+                if "待确认机组" in str(r["备注"]):
                     note_html = (
                         " <span style='color:#d97706;font-weight:bold'>"
                         f"【{r['备注']}】</span>"
