@@ -2,12 +2,19 @@
 """
 国内批复核对工具 - Streamlit 版本
 
-三种判定结果：
-- "是"     ：完全一致
-- "否"     ：有实质差异（时间/机场/用途/国籍/待取消/待变更）
-- "待确认" ：待确认机组（仅信息提示，不算差异）
+外机两种格式：
+- 已批：注册号 + 机型 + 起降 + ON 日期 + FERRY/BUSINESS [备注]
+- 未批：注册号 + 航班号(=注册号) + 起降 + ON 日期 + U/H|N/M [备注] - 待申请
 
-其余规则同前。
+用途映射：
+- FERRY → N/M（调机）
+- BUSINESS → U/H（载客）
+- U/H、N/M 原样
+
+判定结果三态：
+- "是"：完全一致
+- "否"：有实质差异
+- "待确认"：仅信息提示（待确认机组 / 外机未批）
 """
 
 import io
@@ -97,28 +104,12 @@ W272,"Andrew Nigel, KING",Andrew.king@aero.bombardier.com
 """
 
 AIRCRAFT_TYPE_MAP = {
-    "B3926": "LJ60",
-    "B652R": "GLF4",
-    "B8105": "GLEX",
-    "B8160": "GLF5",
-    "B8262": "GLF4",
-    "B8292": "GLF5",
-    "B8309": "GLF5",
-    "MLLIN": "GLEX",
-    "N2QE": "GL5T",
-    "N328LM": "GL7T",
-    "N550DR": "GLF5",
-    "N577QT": "F900",
-    "N7777U": "GLEX",
-    "N777ZH": "GLF5",
-    "N88AY": "GLF5",
-    "T7178HT": "GL7T",
-    "T7CJK": "GLEX",
-    "VPCSZ": "GL7T",
-    "VPCVA": "GLF6",
-    "B652Q": "GLF4",
-    "B652S": "GLF4",
-    "B65AP": "GLF4",
+    "B3926": "LJ60", "B652R": "GLF4", "B8105": "GLEX", "B8160": "GLF5",
+    "B8262": "GLF4", "B8292": "GLF5", "B8309": "GLF5", "MLLIN": "GLEX",
+    "N2QE": "GL5T", "N328LM": "GL7T", "N550DR": "GLF5", "N577QT": "F900",
+    "N7777U": "GLEX", "N777ZH": "GLF5", "N88AY": "GLF5", "T7178HT": "GL7T",
+    "T7CJK": "GLEX", "VPCSZ": "GL7T", "VPCVA": "GLF6", "B652Q": "GLF4",
+    "B652S": "GLF4", "B65AP": "GLF4",
 }
 
 FERRY_KEYWORDS = ("调机", "维修")
@@ -306,18 +297,32 @@ def parse_approval_line(text):
         ac_type = second
         flight_no = ""
     else:
-        ac_type = ""
-        flight_no = second
+        # 外机：第二字段 == 注册号 → 未批（航班号）；否则 → 已批（机型）
+        if second == reg:
+            flight_no = second
+            ac_type = ""
+        else:
+            ac_type = second
+            flight_no = ""
 
+    # 用途解析：先 U/H / N/M，再 FERRY / BUSINESS
     service, remark = "", ""
-    sm = re.match(r"^(U/H|N/M)(.*)$", rest, re.IGNORECASE)
+    sm = re.match(r"^(U/H|N/M)\s*(.*)$", rest, re.IGNORECASE)
     if sm:
         service = sm.group(1).upper()
         remark = sm.group(2).strip()
     else:
-        parts = rest.split(None, 1)
-        service = parts[0].upper() if parts else ""
-        remark = parts[1].strip() if len(parts) > 1 else ""
+        upper = rest.upper()
+        if upper.startswith("FERRY"):
+            service = "N/M"
+            remark = rest[5:].strip(" -–—\t")
+        elif upper.startswith("BUSINESS"):
+            service = "U/H"
+            remark = rest[8:].strip(" -–—\t")
+        else:
+            parts = rest.split(None, 1)
+            service = parts[0].upper() if parts else ""
+            remark = parts[1].strip() if len(parts) > 1 else ""
 
     date_obj = parse_date_token(date_raw)
     return {
@@ -655,14 +660,12 @@ def find_global_template_paragraph(doc):
 
 def _make_red_paragraph_element(text, template_p):
     p_elem = OxmlElement('w:p')
-
     if template_p is not None:
         template_pPr = template_p._element.find(qn('w:pPr'))
         if template_pPr is not None:
             p_elem.append(copy.deepcopy(template_pPr))
 
     r_elem = OxmlElement('w:r')
-
     rPr = None
     if template_p is not None:
         for r in template_p.runs:
@@ -670,23 +673,18 @@ def _make_red_paragraph_element(text, template_p):
             if rPr_src is not None:
                 rPr = copy.deepcopy(rPr_src)
                 break
-
     if rPr is None:
         rPr = OxmlElement('w:rPr')
-
     for c in rPr.findall(W_COLOR):
         rPr.remove(c)
     color = OxmlElement('w:color')
     color.set(qn('w:val'), RED)
     rPr.append(color)
-
     r_elem.append(rPr)
-
     t_elem = OxmlElement('w:t')
     t_elem.text = text
     t_elem.set(qn('xml:space'), 'preserve')
     r_elem.append(t_elem)
-
     p_elem.append(r_elem)
     return p_elem
 
@@ -705,7 +703,6 @@ def _reorder_cell_with_pending(cell, pending_items, global_template_p):
             })
             if template_p is None:
                 template_p = p
-
     if template_p is None:
         template_p = global_template_p
 
@@ -791,6 +788,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
 
     used_excel = set()
     used_text = set()
+    unapproved_keys = set()   # (reg, dep, arr) 已申请但未批
 
     # ===== 第一遍：核对 docx 已有批复 =====
     for p in iter_doc_paragraphs(doc):
@@ -802,11 +800,37 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         if not approval:
             continue
 
+        # 外机未批 → 输出一行"未批"，不参与比对
+        if not approval["is_domestic"] and approval["flight_no"]:
+            unapproved_keys.add(
+                (approval["reg"], approval["dep"], approval["arr"])
+            )
+            result_rows.append({
+                "批复": raw_text,
+                "飞机号": approval["reg"],
+                "航班号": approval["flight_no"],
+                "机型": AIRCRAFT_TYPE_MAP.get(approval["reg"], ""),
+                "内/外机": "外机",
+                "批复起飞(北京时)": approval["dep_dt_bj"].strftime("%H:%M"),
+                "批复落地(北京时)": approval["arr_dt_bj"].strftime("%H:%M"),
+                "批复日期": approval["dep_dt_bj"].date().isoformat(),
+                "Excel 用途": "",
+                "文本标记": "",
+                "Excel 计划起飞": "",
+                "Excel 计划落地": "",
+                "Excel 出发地": "",
+                "Excel 到达地": "",
+                "差异": "外机未批（已申请）",
+                "是否一致": "待确认",
+                "备注": "未批",
+            })
+            continue
+
         red_parts = []
         green_parts = []
         diffs = []
-        note_parts = []       # 真实差异备注：待取消、待变更
-        info_note = ""        # 信息提示：待确认机组
+        note_parts = []
+        info_note = ""
 
         excel_row = find_excel_match(approval, excel_rows, used_excel)
 
@@ -888,7 +912,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
             )
             red_parts.append(approval["dep_time_raw"])
             change_paragraphs.add(raw_text)
-        else:  # real_dep_diff < -EARLY_GREEN_THRESHOLD_MIN
+        else:
             dep_ok = False
             diffs.append(
                 f"起飞时间：批复 {approval_dep_time} vs 计划 {excel_row['dep_time']}"
@@ -933,12 +957,11 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                 if approval["service"] not in red_parts:
                     red_parts.append(approval["service"])
 
-        # 国籍（内机）
+        # 国籍
         if approval["is_domestic"]:
             if text_flight:
                 all_cn = crew_all_chinese(text_flight["crew"], pilots)
                 if all_cn is None:
-                    # 机组信息不全 → 信息提示，不算差异
                     info_note = "待确认机组"
                 else:
                     has_cn = "中国籍" in approval["remark"]
@@ -956,18 +979,15 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                         elif not has_foreign:
                             diffs.append("国籍未标注（应为外籍）")
             else:
-                # 文本未提供该航段 → 信息提示，不算差异
                 info_note = "待确认机组"
 
         if raw_text in change_paragraphs:
             note_parts.append("待变更")
 
-        # 组合备注
         final_notes = list(note_parts)
         if info_note:
             final_notes.append(info_note)
 
-        # 判定结果：三态
         if diffs or note_parts:
             consistency = "否"
         elif info_note:
@@ -1033,6 +1053,9 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         if row["_idx"] in used_excel:
             continue
         if row["dep_date"] is None:
+            continue
+        # 已申请但未批的，不再重复提示
+        if (row["reg"], row["dep"], row["arr"]) in unapproved_keys:
             continue
         pending_by_reg.setdefault(row["reg"], []).append(row)
 
@@ -1169,15 +1192,15 @@ with st.sidebar:
         "- 飞行员名单、机型对照表已内置\n"
         "- **Excel 匹配**：注册号 + 起降机场 + 日期（同日优先；其次差 1 天且真实时差 ≤ 10 小时）\n"
         "- **文本匹配**：注册号 + 起降城市 完全一致（一条只能用一次）\n"
-        "- **三种结果**：\n"
-        "  · `是`：完全一致\n"
-        "  · `否`：有实质差异（时间/机场/用途/国籍/待取消/待变更）\n"
-        "  · `待确认`：机组信息不全（仅提示，不算差异）\n"
+        "- **外机格式**：\n"
+        "  · 已批：`注册号 机型 ... FERRY/BUSINESS` → 正常比对\n"
+        "  · 未批：`注册号 航班号(=注册号) ... U/H|N/M` → 跳过比对，不重复提示待申请\n"
+        "- **用途映射**：`FERRY`→`N/M`；`BUSINESS`→`U/H`\n"
+        "- **三种结果**：是 / 否 / 待确认\n"
         "- **待取消**：Excel 里找不到匹配（含 ±1 天宽容）→ 追加红色“待取消”\n"
         "- **待申请**：Excel 有但未被任何批复使用（含 Z 机场）→ 按日期插入\n"
-        "- **用途规则**：Excel 为 `调机` / `维修` → `N/M`；其余 → `U/H`\n"
-        "- **起飞时间**（考虑日期）：早 ≤ 10h → 标绿；晚于 Excel → 报差异 + 待变更；早 > 10h → 标红\n"
-        "- **落地时间**（考虑日期）：早 ≤ 10h（且起飞正常）→ 标绿"
+        "- **起飞时间**：早 ≤ 10h → 标绿；晚于 Excel → 报差异 + 待变更；早 > 10h → 标红\n"
+        "- **落地时间**：早 ≤ 10h（且起飞正常）→ 标绿"
     )
 
 text_input = st.text_area(
@@ -1241,7 +1264,6 @@ if st.button("🚀 开始核对", type="primary"):
         )
 
         st.subheader("🚨 差异明细")
-        # 包含 "否" 和 "待确认"
         diffs_df = df[df["是否一致"] != "是"][["批复", "差异", "备注", "是否一致"]]
         if diffs_df.empty:
             st.success("✅ 所有批复与计划一致，未发现差异。")
