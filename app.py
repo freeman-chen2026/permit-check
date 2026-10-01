@@ -9,6 +9,7 @@
 - 待申请简洁格式：`VPCSZ ZGSZ-ZBAD 07OCT 待申请`
 - 追加文字（待取消/待变更/待申请）红字 + 黄底
 - 三态判定：是 / 否 / 待确认
+- 文本覆盖率预检查（< 60% 报错，60~85% 警告，≥ 85% 通过）
 """
 
 import io
@@ -39,6 +40,9 @@ HIGHLIGHT_YELLOW = "yellow"
 
 MAX_CROSS_DAY_GAP_MIN = 600
 EARLY_GREEN_THRESHOLD_MIN = 600
+
+COVERAGE_ERROR_THRESHOLD = 0.60   # < 60% → 报错
+COVERAGE_WARN_THRESHOLD = 0.85    # 60%~85% → 警告；≥ 85% → 通过
 
 PILOT_RAW = """P001,庚凡,gengfan@amber-aviation.com
 P002,张永一,zhangyongyi@amber-aviation.com
@@ -507,6 +511,46 @@ def load_text_flights(text: str):
                     continue
         i += 1
     return flights
+
+
+# =========================================================
+# 文本覆盖率检查
+# =========================================================
+def check_text_coverage(excel_rows, text_flights, city_to_icao):
+    """
+    检查文本计划对 Excel 国内航段的覆盖率。
+    只统计起降机场至少一个 Z 开头的航段。
+    匹配方式：注册号 + 起降城市（映射到四字码）。
+    返回 (total, covered, missing_list)
+    """
+    domestic_rows = [
+        r for r in excel_rows
+        if (r["dep"].startswith("Z") or r["arr"].startswith("Z"))
+        and r["dep"]
+        and r["arr"]
+    ]
+
+    text_by_reg = {}
+    for tf in text_flights:
+        text_by_reg.setdefault(tf["reg"], []).append(tf)
+
+    covered = 0
+    missing = []
+    for r in domestic_rows:
+        candidates = text_by_reg.get(r["reg"], [])
+        found = False
+        for tf in candidates:
+            dep_icao = city_to_icao.get(tf["dep_city"])
+            arr_icao = city_to_icao.get(tf["arr_city"])
+            if dep_icao == r["dep"] and arr_icao == r["arr"]:
+                found = True
+                break
+        if found:
+            covered += 1
+        else:
+            missing.append(r)
+
+    return len(domestic_rows), covered, missing
 
 
 # =========================================================
@@ -1270,6 +1314,7 @@ with st.sidebar:
         "**说明**\n"
         "- 飞行员名单、机型对照表已内置\n"
         "- **软换行自动拆分**：Shift+Enter 产生的软换行会被拆成独立段落\n"
+        "- **文本覆盖率预检查**：< 60% 报错，60~85% 警告，≥ 85% 通过\n"
         "- **Excel 匹配**：注册号 + 起降机场 + 日期（同日优先；其次差 1 天且真实时差 ≤ 10 小时）\n"
         "- **文本匹配**：注册号 + 起降城市 完全一致（一条只能用一次）\n"
         "- **外机格式**：已批 `注册号 机型 ... FERRY/BUSINESS`；未批 `注册号 航班号(=注册号) ...`\n"
@@ -1298,6 +1343,59 @@ if not docx_file or not excel_file or not text_content:
     st.stop()
 
 if st.button("🚀 开始核对", type="primary"):
+    # ===== 第一步：文本覆盖率预检查 =====
+    with st.spinner("正在检查文本覆盖率..."):
+        preview_excel_rows = load_excel_rows_from_bytes(excel_file.getvalue())
+        preview_text_flights = load_text_flights(text_content)
+
+        preview_city_to_icao = {}
+        for row in preview_excel_rows:
+            if row["dep_city"]:
+                preview_city_to_icao[row["dep_city"]] = row["dep"]
+            if row["arr_city"]:
+                preview_city_to_icao[row["arr_city"]] = row["arr"]
+
+        total, covered, missing = check_text_coverage(
+            preview_excel_rows, preview_text_flights, preview_city_to_icao
+        )
+
+    if total == 0:
+        st.warning("Excel 里没有国内航段（Z 开头机场），无需核对。")
+        st.stop()
+
+    coverage = covered / total
+
+    if coverage < COVERAGE_ERROR_THRESHOLD:
+        st.error(
+            f"❌ 文本计划覆盖率过低：{covered}/{total}（{coverage*100:.1f}%）"
+        )
+        st.markdown(
+            "**以下航段在文本计划里找不到对应，请检查是否漏贴：**"
+        )
+        for r in missing[:30]:
+            date_str = r["dep_date"].isoformat() if r["dep_date"] else "?"
+            st.markdown(
+                f"- `{r['reg']}`  {r['dep']}→{r['arr']}  "
+                f"{date_str} {r['dep_time']}"
+            )
+        if len(missing) > 30:
+            st.markdown(f"- ... 还有 {len(missing) - 30} 条")
+        st.warning(
+            "请重新上传包含完整航班的文本计划，再点击「开始核对」。"
+        )
+        st.stop()
+
+    if coverage < COVERAGE_WARN_THRESHOLD:
+        st.warning(
+            f"⚠️ 文本计划覆盖率：{covered}/{total}（{coverage*100:.1f}%），"
+            f"有 {total - covered} 条航段未在文本里找到，已继续核对。"
+        )
+    else:
+        st.success(
+            f"✅ 文本计划覆盖率：{covered}/{total}（{coverage*100:.1f}%）"
+        )
+
+    # ===== 第二步：正式核对 =====
     with st.spinner("正在核对..."):
         try:
             rows, out_buf = run_check(
@@ -1311,18 +1409,18 @@ if st.button("🚀 开始核对", type="primary"):
             st.stop()
 
     df = pd.DataFrame(rows)
-    total = len(df)
-    diff_count = (df["是否一致"] == "否").sum() if total else 0
-    pending_count = (df["是否一致"] == "待确认").sum() if total else 0
+    total_rows = len(df)
+    diff_count = (df["是否一致"] == "否").sum() if total_rows else 0
+    pending_count = (df["是否一致"] == "待确认").sum() if total_rows else 0
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("批复条数", total)
-    c2.metric("一致", total - diff_count - pending_count)
+    c1.metric("批复条数", total_rows)
+    c2.metric("一致", total_rows - diff_count - pending_count)
     c3.metric("有差异", diff_count)
     c4.metric("待确认", pending_count)
 
     st.subheader("📋 核对结果")
-    if total == 0:
+    if total_rows == 0:
         st.warning("未在 docx 中识别到任何批复行。")
     else:
         def highlight(row):
@@ -1374,3 +1472,4 @@ if st.button("🚀 开始核对", type="primary"):
         file_name=docx_file.name,
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
+    
