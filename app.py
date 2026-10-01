@@ -6,15 +6,17 @@
 - 已批：注册号 + 机型 + 起降 + ON 日期 + FERRY/BUSINESS [备注]
 - 未批：注册号 + 航班号(=注册号) + 起降 + ON 日期 + U/H|N/M [备注] - 待申请
 
-用途映射：
-- FERRY → N/M（调机）
-- BUSINESS → U/H（载客）
-- U/H、N/M 原样
+用途映射：FERRY → N/M；BUSINESS → U/H
 
 判定结果三态：
 - "是"：完全一致
 - "否"：有实质差异
 - "待确认"：仅信息提示（待确认机组 / 外机未批）
+
+待申请行格式（简洁）：`注册号 起降机场 日期 [国籍] 待申请`
+例如：`VPCSZ ZGSZ-ZBAD 07OCT 待申请`
+
+软换行（Shift+Enter）自动拆分为独立段落
 """
 
 import io
@@ -297,7 +299,7 @@ def parse_approval_line(text):
         ac_type = second
         flight_no = ""
     else:
-        # 外机：第二字段 == 注册号 → 未批（航班号）；否则 → 已批（机型）
+        # 外机：第二字段 == 注册号 → 未批；否则 → 已批（第二字段=机型）
         if second == reg:
             flight_no = second
             ac_type = ""
@@ -305,7 +307,7 @@ def parse_approval_line(text):
             ac_type = second
             flight_no = ""
 
-    # 用途解析：先 U/H / N/M，再 FERRY / BUSINESS
+    # 用途解析：U/H / N/M 优先，其次 FERRY / BUSINESS
     service, remark = "", ""
     sm = re.match(r"^(U/H|N/M)\s*(.*)$", rest, re.IGNORECASE)
     if sm:
@@ -356,6 +358,81 @@ def iter_doc_paragraphs(doc):
                         for ncell in nrow.cells:
                             for np in ncell.paragraphs:
                                 yield np
+
+
+# =========================================================
+# 软换行（<w:br/>）拆分成独立段落
+# =========================================================
+def _collect_all_paragraphs(doc):
+    result = []
+    for p in doc.paragraphs:
+        result.append(p)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    result.append(p)
+                for nested in cell.tables:
+                    for nrow in nested.rows:
+                        for ncell in nrow.cells:
+                            for np in ncell.paragraphs:
+                                result.append(np)
+    return result
+
+
+def _split_paragraph_by_br(p_elem):
+    """把段落里的 <w:br/> 拆成多个独立段落"""
+    parent = p_elem.getparent()
+    if parent is None:
+        return
+    idx_in_parent = list(parent).index(p_elem)
+    pPr = p_elem.find(qn('w:pPr'))
+
+    groups = [[]]
+    for child in list(p_elem):
+        if child.tag == qn('w:pPr'):
+            continue
+        if child.tag == qn('w:r'):
+            brs = child.findall(qn('w:br'))
+            if not brs:
+                groups[-1].append(copy.deepcopy(child))
+            else:
+                current_r_children = []
+                for rc in list(child):
+                    if rc.tag == qn('w:br'):
+                        if current_r_children:
+                            new_r = OxmlElement('w:r')
+                            for x in current_r_children:
+                                new_r.append(copy.deepcopy(x))
+                            groups[-1].append(new_r)
+                            current_r_children = []
+                        groups.append([])
+                    else:
+                        current_r_children.append(rc)
+                if current_r_children:
+                    new_r = OxmlElement('w:r')
+                    for x in current_r_children:
+                        new_r.append(copy.deepcopy(x))
+                    groups[-1].append(new_r)
+        else:
+            groups[-1].append(copy.deepcopy(child))
+
+    if len(groups) <= 1:
+        return
+
+    parent.remove(p_elem)
+    for i, group in enumerate(groups):
+        new_p = OxmlElement('w:p')
+        if pPr is not None:
+            new_p.append(copy.deepcopy(pPr))
+        for child in group:
+            new_p.append(child)
+        parent.insert(idx_in_parent + i, new_p)
+
+
+def normalize_soft_breaks(doc):
+    for p in _collect_all_paragraphs(doc):
+        _split_paragraph_by_br(p._element)
 
 
 # =========================================================
@@ -728,40 +805,32 @@ def _reorder_cell_with_pending(cell, pending_items, global_template_p):
 
 
 # =========================================================
-# 构造"待申请"批复文本
+# 构造"待申请"简洁文本
 # =========================================================
-def build_approval_text(excel_row, is_domestic):
+def build_approval_text(excel_row, is_domestic, note_kind=""):
+    """
+    简洁格式：注册号 起降机场 日期 [国籍] 待申请
+    例如：VPCSZ ZGSZ-ZBAD 07OCT 待申请
+         B652Q ZSNB-ZSAM 04OCT 中国籍 待申请
+    """
     reg = excel_row["reg"]
     dep_date = excel_row["dep_date"]
-    arr_date = excel_row["arr_date"] or dep_date
-    dep_time = parse_hhmm_str(excel_row["dep_time"])
-    arr_time = parse_hhmm_str(excel_row["arr_time"])
-
-    if not (dep_date and arr_date and dep_time and arr_time):
+    if not dep_date:
         return None
 
-    dep_dt = datetime.datetime.combine(dep_date, dep_time)
-    arr_dt = datetime.datetime.combine(arr_date, arr_time)
+    date_str = dep_date.strftime("%d%b").upper()
+    parts = [reg, f"{excel_row['dep']}-{excel_row['arr']}", date_str]
 
     if is_domestic:
-        date_fmt = "%d%b%Y"
-        second_field = AIRCRAFT_TYPE_MAP.get(reg, "")
-    else:
-        dep_dt -= datetime.timedelta(hours=8)
-        arr_dt -= datetime.timedelta(hours=8)
-        date_fmt = "%d%b%y"
-        second_field = reg
+        if note_kind == "中国籍":
+            parts.append("中国籍")
+        elif note_kind == "外籍":
+            parts.append("外籍")
+        elif note_kind == "机组未定":
+            parts.append("机组未定")
 
-    service = "N/M" if is_ferry_use(excel_row["use"]) else "U/H"
-
-    dep_time_str = dep_dt.strftime("%H%M")
-    arr_time_str = arr_dt.strftime("%H%M")
-    date_str = dep_dt.strftime(date_fmt).upper()
-
-    return (f"{reg} {second_field} "
-            f"{excel_row['dep']}{dep_time_str} "
-            f"{arr_time_str}{excel_row['arr']} "
-            f"ON {date_str} {service}")
+    parts.append("待申请")
+    return " ".join(parts)
 
 
 # =========================================================
@@ -779,6 +848,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
             city_to_icao[row["arr_city"]] = row["arr"]
 
     doc = Document(io.BytesIO(docx_bytes))
+    normalize_soft_breaks(doc)   # 软换行拆分成独立段落
 
     result_rows = []
     approval_red_map = {}
@@ -788,7 +858,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
 
     used_excel = set()
     used_text = set()
-    unapproved_keys = set()   # (reg, dep, arr) 已申请但未批
+    unapproved_keys = set()   # (reg, dep, arr) 外机已申请未批
 
     # ===== 第一遍：核对 docx 已有批复 =====
     for p in iter_doc_paragraphs(doc):
@@ -957,7 +1027,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                 if approval["service"] not in red_parts:
                     red_parts.append(approval["service"])
 
-        # 国籍
+        # 国籍（仅内机）
         if approval["is_domestic"]:
             if text_flight:
                 all_cn = crew_all_chinese(text_flight["crew"], pilots)
@@ -1035,7 +1105,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                 [(GREEN, green), (RED, red)]
             )
 
-    # 追加
+    # 追加"待取消" / "待变更"
     for p in iter_doc_paragraphs(doc):
         raw_text = p.text.strip()
         if raw_text in cancel_paragraphs:
@@ -1054,7 +1124,6 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
             continue
         if row["dep_date"] is None:
             continue
-        # 已申请但未批的，不再重复提示
         if (row["reg"], row["dep"], row["arr"]) in unapproved_keys:
             continue
         pending_by_reg.setdefault(row["reg"], []).append(row)
@@ -1070,16 +1139,12 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         is_domestic = is_b_reg(reg)
         items = []
         for row in rows:
-            text = build_approval_text(row, is_domestic)
-            if not text:
-                continue
             dep_t = parse_hhmm_str(row["dep_time"])
             if not row["dep_date"] or not dep_t:
                 continue
             dep_dt_bj = datetime.datetime.combine(row["dep_date"], dep_t)
 
             note_kind = ""
-
             if is_domestic:
                 fake_ap = {
                     "reg": reg,
@@ -1088,7 +1153,6 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                     "dep_dt_bj": dep_dt_bj,
                 }
                 tf = find_text_match(fake_ap, text_flights, city_to_icao, used_text)
-
                 if tf is None or not tf["crew"]:
                     note_kind = "机组未定"
                 else:
@@ -1100,18 +1164,13 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                     else:
                         note_kind = "机组未定"
 
-            if note_kind == "机组未定":
-                full_text = text + "  待申请（机组未定，需确认）"
-            elif note_kind == "中国籍":
-                full_text = text + " 中国籍  待申请"
-            elif note_kind == "外籍":
-                full_text = text + " 外籍  待申请"
-            else:
-                full_text = text + "  待申请"
+            text = build_approval_text(row, is_domestic, note_kind)
+            if not text:
+                continue
 
             items.append({
                 "dt": dep_dt_bj,
-                "text": full_text,
+                "text": text,
                 "row": row,
                 "note_kind": note_kind,
             })
@@ -1190,6 +1249,7 @@ with st.sidebar:
     st.markdown(
         "**说明**\n"
         "- 飞行员名单、机型对照表已内置\n"
+        "- **软换行自动拆分**：Word 里 Shift+Enter 产生的软换行会被拆成独立段落，批复可被正确识别\n"
         "- **Excel 匹配**：注册号 + 起降机场 + 日期（同日优先；其次差 1 天且真实时差 ≤ 10 小时）\n"
         "- **文本匹配**：注册号 + 起降城市 完全一致（一条只能用一次）\n"
         "- **外机格式**：\n"
@@ -1198,7 +1258,7 @@ with st.sidebar:
         "- **用途映射**：`FERRY`→`N/M`；`BUSINESS`→`U/H`\n"
         "- **三种结果**：是 / 否 / 待确认\n"
         "- **待取消**：Excel 里找不到匹配（含 ±1 天宽容）→ 追加红色“待取消”\n"
-        "- **待申请**：Excel 有但未被任何批复使用（含 Z 机场）→ 按日期插入\n"
+        "- **待申请**：Excel 有但批复没有（含 Z 机场）→ 简洁格式插入，如 `VPCSZ ZGSZ-ZBAD 07OCT 待申请`\n"
         "- **起飞时间**：早 ≤ 10h → 标绿；晚于 Excel → 报差异 + 待变更；早 > 10h → 标红\n"
         "- **落地时间**：早 ≤ 10h（且起飞正常）→ 标绿"
     )
