@@ -2,21 +2,13 @@
 """
 国内批复核对工具 - Streamlit 版本
 
-外机两种格式：
-- 已批：注册号 + 机型 + 起降 + ON 日期 + FERRY/BUSINESS [备注]
-- 未批：注册号 + 航班号(=注册号) + 起降 + ON 日期 + U/H|N/M [备注] - 待申请
-
-用途映射：FERRY → N/M；BUSINESS → U/H
-
-判定结果三态：
-- "是"：完全一致
-- "否"：有实质差异
-- "待确认"：仅信息提示（待确认机组 / 外机未批）
-
-待申请行格式（简洁）：`注册号 起降机场 日期 [国籍] 待申请`
-例如：`VPCSZ ZGSZ-ZBAD 07OCT 待申请`
-
-软换行（Shift+Enter）自动拆分为独立段落
+主要特性：
+- 软换行（Shift+Enter）自动拆分成独立段落
+- 外机两种格式识别（已批 / 未批）
+- 用途映射：FERRY → N/M；BUSINESS → U/H
+- 待申请简洁格式：`VPCSZ ZGSZ-ZBAD 07OCT 待申请`
+- 追加文字（待取消/待变更/待申请）红字 + 黄底
+- 三态判定：是 / 否 / 待确认
 """
 
 import io
@@ -43,6 +35,7 @@ MONTHS = {
 
 RED = "FF0000"
 GREEN = "00B050"
+HIGHLIGHT_YELLOW = "yellow"
 
 MAX_CROSS_DAY_GAP_MIN = 600
 EARLY_GREEN_THRESHOLD_MIN = 600
@@ -299,7 +292,6 @@ def parse_approval_line(text):
         ac_type = second
         flight_no = ""
     else:
-        # 外机：第二字段 == 注册号 → 未批；否则 → 已批（第二字段=机型）
         if second == reg:
             flight_no = second
             ac_type = ""
@@ -307,7 +299,6 @@ def parse_approval_line(text):
             ac_type = second
             flight_no = ""
 
-    # 用途解析：U/H / N/M 优先，其次 FERRY / BUSINESS
     service, remark = "", ""
     sm = re.match(r"^(U/H|N/M)\s*(.*)$", rest, re.IGNORECASE)
     if sm:
@@ -381,7 +372,6 @@ def _collect_all_paragraphs(doc):
 
 
 def _split_paragraph_by_br(p_elem):
-    """把段落里的 <w:br/> 拆成多个独立段落"""
     parent = p_elem.getparent()
     if parent is None:
         return
@@ -588,12 +578,13 @@ def find_text_match(approval, text_flights, city_to_icao, used_text):
 
 
 # =========================================================
-# docx 标红/标绿/追加
+# docx 标红/标绿/高亮/追加
 # =========================================================
 W_R = qn('w:r')
 W_RPR = qn('w:rPr')
 W_COLOR = qn('w:color')
 W_T = qn('w:t')
+W_HIGHLIGHT = qn('w:highlight')
 
 
 def _set_run_color(run_element, color_hex):
@@ -607,7 +598,18 @@ def _set_run_color(run_element, color_hex):
     rPr.append(color)
 
 
-def _make_run_like(src_run_elem, text, color_hex=None):
+def _set_run_highlight(run_element, color_name=HIGHLIGHT_YELLOW):
+    rPr = run_element.find(W_RPR)
+    if rPr is None:
+        rPr = run_element.makeelement(W_RPR, {})
+        run_element.insert(0, rPr)
+    for h in rPr.findall(W_HIGHLIGHT):
+        rPr.remove(h)
+    hl = rPr.makeelement(W_HIGHLIGHT, {qn('w:val'): color_name})
+    rPr.append(hl)
+
+
+def _make_run_like(src_run_elem, text, color_hex=None, highlight=None):
     new_r = copy.deepcopy(src_run_elem)
     for t in new_r.findall(W_T):
         new_r.remove(t)
@@ -617,10 +619,13 @@ def _make_run_like(src_run_elem, text, color_hex=None):
     new_r.append(t)
     if color_hex:
         _set_run_color(new_r, color_hex)
+    if highlight:
+        _set_run_highlight(new_r, highlight)
     return new_r
 
 
 def set_paragraph_runs(paragraph, text, color_overrides):
+    """已有批复上的标色（不加高亮）"""
     if not color_overrides:
         return
     runs = list(paragraph.runs)
@@ -689,17 +694,20 @@ def set_paragraph_runs(paragraph, text, color_overrides):
 
 
 def append_red_text(paragraph, text):
+    """待取消/待变更：红字 + 黄底"""
     runs = list(paragraph.runs)
     p_elem = paragraph._element
     if runs:
         src = runs[-1]._element
-        new_r = _make_run_like(src, text, color_hex=RED)
+        new_r = _make_run_like(src, text, color_hex=RED, highlight=HIGHLIGHT_YELLOW)
     else:
         new_r = p_elem.makeelement(W_R, {})
         rPr = new_r.makeelement(W_RPR, {})
         new_r.insert(0, rPr)
         color = rPr.makeelement(W_COLOR, {qn('w:val'): RED})
         rPr.append(color)
+        hl = rPr.makeelement(W_HIGHLIGHT, {qn('w:val'): HIGHLIGHT_YELLOW})
+        rPr.append(hl)
         t = new_r.makeelement(W_T, {})
         t.text = text
         t.set(qn('xml:space'), 'preserve')
@@ -736,6 +744,7 @@ def find_global_template_paragraph(doc):
 
 
 def _make_red_paragraph_element(text, template_p):
+    """待申请新段落：红字 + 黄底"""
     p_elem = OxmlElement('w:p')
     if template_p is not None:
         template_pPr = template_p._element.find(qn('w:pPr'))
@@ -752,16 +761,27 @@ def _make_red_paragraph_element(text, template_p):
                 break
     if rPr is None:
         rPr = OxmlElement('w:rPr')
+
     for c in rPr.findall(W_COLOR):
         rPr.remove(c)
+    for h in rPr.findall(W_HIGHLIGHT):
+        rPr.remove(h)
+
     color = OxmlElement('w:color')
     color.set(qn('w:val'), RED)
     rPr.append(color)
+
+    hl = OxmlElement('w:highlight')
+    hl.set(qn('w:val'), HIGHLIGHT_YELLOW)
+    rPr.append(hl)
+
     r_elem.append(rPr)
+
     t_elem = OxmlElement('w:t')
     t_elem.text = text
     t_elem.set(qn('xml:space'), 'preserve')
     r_elem.append(t_elem)
+
     p_elem.append(r_elem)
     return p_elem
 
@@ -848,7 +868,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
             city_to_icao[row["arr_city"]] = row["arr"]
 
     doc = Document(io.BytesIO(docx_bytes))
-    normalize_soft_breaks(doc)   # 软换行拆分成独立段落
+    normalize_soft_breaks(doc)
 
     result_rows = []
     approval_red_map = {}
@@ -858,7 +878,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
 
     used_excel = set()
     used_text = set()
-    unapproved_keys = set()   # (reg, dep, arr) 外机已申请未批
+    unapproved_keys = set()
 
     # ===== 第一遍：核对 docx 已有批复 =====
     for p in iter_doc_paragraphs(doc):
@@ -870,7 +890,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
         if not approval:
             continue
 
-        # 外机未批 → 输出一行"未批"，不参与比对
+        # 外机未批
         if not approval["is_domestic"] and approval["flight_no"]:
             unapproved_keys.add(
                 (approval["reg"], approval["dep"], approval["arr"])
@@ -1027,7 +1047,7 @@ def run_check(docx_bytes, excel_bytes, text_content, pilots):
                 if approval["service"] not in red_parts:
                     red_parts.append(approval["service"])
 
-        # 国籍（仅内机）
+        # 国籍
         if approval["is_domestic"]:
             if text_flight:
                 all_cn = crew_all_chinese(text_flight["crew"], pilots)
@@ -1249,18 +1269,15 @@ with st.sidebar:
     st.markdown(
         "**说明**\n"
         "- 飞行员名单、机型对照表已内置\n"
-        "- **软换行自动拆分**：Word 里 Shift+Enter 产生的软换行会被拆成独立段落，批复可被正确识别\n"
+        "- **软换行自动拆分**：Shift+Enter 产生的软换行会被拆成独立段落\n"
         "- **Excel 匹配**：注册号 + 起降机场 + 日期（同日优先；其次差 1 天且真实时差 ≤ 10 小时）\n"
         "- **文本匹配**：注册号 + 起降城市 完全一致（一条只能用一次）\n"
-        "- **外机格式**：\n"
-        "  · 已批：`注册号 机型 ... FERRY/BUSINESS` → 正常比对\n"
-        "  · 未批：`注册号 航班号(=注册号) ... U/H|N/M` → 跳过比对，不重复提示待申请\n"
+        "- **外机格式**：已批 `注册号 机型 ... FERRY/BUSINESS`；未批 `注册号 航班号(=注册号) ...`\n"
         "- **用途映射**：`FERRY`→`N/M`；`BUSINESS`→`U/H`\n"
         "- **三种结果**：是 / 否 / 待确认\n"
-        "- **待取消**：Excel 里找不到匹配（含 ±1 天宽容）→ 追加红色“待取消”\n"
-        "- **待申请**：Excel 有但批复没有（含 Z 机场）→ 简洁格式插入，如 `VPCSZ ZGSZ-ZBAD 07OCT 待申请`\n"
-        "- **起飞时间**：早 ≤ 10h → 标绿；晚于 Excel → 报差异 + 待变更；早 > 10h → 标红\n"
-        "- **落地时间**：早 ≤ 10h（且起飞正常）→ 标绿"
+        "- **待取消 / 待变更**：段落末尾追加**红字黄底**文字\n"
+        "- **待申请**：简洁格式插入（如 `VPCSZ ZGSZ-ZBAD 07OCT 待申请`），**红字黄底**\n"
+        "- **已有批复标红/标绿**：只改字体颜色，不加黄底"
     )
 
 text_input = st.text_area(
