@@ -9,7 +9,7 @@
 - 待申请简洁格式：`VPCSZ ZGSZ-ZBAD 07OCT 待申请`
 - 追加文字（待取消/待变更/待申请）红字 + 黄底
 - 三态判定：是 / 否 / 待确认
-- 文本覆盖率检查：粘贴后立即执行，缺失航段可展开复制
+- 文本覆盖率检查：粘贴后立即执行，必须 100% 才能点「开始核对」
 """
 
 import io
@@ -40,9 +40,6 @@ HIGHLIGHT_YELLOW = "yellow"
 
 MAX_CROSS_DAY_GAP_MIN = 600
 EARLY_GREEN_THRESHOLD_MIN = 600
-
-COVERAGE_ERROR_THRESHOLD = 0.60
-COVERAGE_WARN_THRESHOLD = 0.85
 
 PILOT_RAW = """P001,庚凡,gengfan@amber-aviation.com
 P002,张永一,zhangyongyi@amber-aviation.com
@@ -1291,7 +1288,7 @@ with st.sidebar:
         "**说明**\n"
         "- 飞行员名单、机型对照表已内置\n"
         "- **软换行自动拆分**：Shift+Enter 产生的软换行会被拆成独立段落\n"
-        "- **文本覆盖率检查**：粘贴文本后立即执行，缺失航段可展开复制\n"
+        "- **文本覆盖率检查**：粘贴文本后立即执行，必须 **100%** 才能点「开始核对」\n"
         "- **Excel 匹配**：注册号 + 起降机场 + 日期（同日优先；其次差 1 天且真实时差 ≤ 10 小时）\n"
         "- **文本匹配**：注册号 + 起降城市 完全一致（一条只能用一次）\n"
         "- **外机格式**：已批 `注册号 机型 ... FERRY/BUSINESS`；未批 `注册号 航班号(=注册号) ...`\n"
@@ -1315,7 +1312,8 @@ text_input = st.text_area(
 
 text_content = text_input.strip()
 
-# ===== 文本覆盖率检查（粘贴后立即执行，不需要点按钮）=====
+# ===== 文本覆盖率检查（粘贴后立即执行）=====
+coverage_ok = False   # 是否 100%
 if docx_file and excel_file and text_content:
     preview_excel_rows = load_excel_rows_from_bytes(excel_file.getvalue())
     preview_text_flights = load_text_flights(text_content)
@@ -1335,28 +1333,26 @@ if docx_file and excel_file and text_content:
 
     if total == 0:
         st.warning("Excel 里没有国内航段（Z 开头机场），无需核对。")
+        coverage_ok = True
     else:
         coverage = covered / total
 
-        if coverage >= COVERAGE_WARN_THRESHOLD:
+        if coverage >= 1.0:
             st.success(
-                f"✅ 文本计划覆盖率：{covered}/{total}（{coverage*100:.1f}%）"
+                f"✅ 文本计划覆盖率：{covered}/{total}（100.0%）—— 可以开始核对"
             )
-        elif coverage >= COVERAGE_ERROR_THRESHOLD:
-            st.warning(
-                f"⚠️ 文本计划覆盖率：{covered}/{total}（{coverage*100:.1f}%），"
-                f"缺 {total - covered} 条。可以核对，但建议补全。"
-            )
+            coverage_ok = True
         else:
             st.error(
-                f"❌ 文本计划覆盖率过低：{covered}/{total}（{coverage*100:.1f}%），"
-                f"缺 {total - covered} 条。请先补全文本。"
+                f"❌ 文本计划覆盖率不足：{covered}/{total}（{coverage*100:.1f}%），"
+                f"缺 {total - covered} 条。**必须 100% 才能开始核对**，请先补全文本。"
             )
+            coverage_ok = False
 
         if missing:
             with st.expander(
                 f"📋 缺失航段明细（{len(missing)} 条）—— 点开查看 / 复制",
-                expanded=(coverage < COVERAGE_WARN_THRESHOLD),
+                expanded=True,
             ):
                 missing_sorted = sorted(
                     missing,
@@ -1376,11 +1372,9 @@ if docx_file and excel_file and text_content:
                 st.code("\n".join(lines), language=None)
 
 # ===== 正式核对 =====
-if st.button(
-    "🚀 开始核对",
-    type="primary",
-    disabled=not (docx_file and excel_file and text_content),
-):
+can_run = bool(docx_file and excel_file and text_content) and coverage_ok
+
+if st.button("🚀 开始核对", type="primary", disabled=not can_run):
     with st.spinner("正在核对..."):
         try:
             rows, out_buf = run_check(
